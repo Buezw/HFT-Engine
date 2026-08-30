@@ -1,5 +1,10 @@
 # HFT Order Book Engine — Optimization & Benchmark
 
+CI workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (runs
+`make test`, `make bench`, `make asan`, `make cppcheck` on every push/PR —
+badge omitted until this is pushed to a repo GitHub can render status for).
+License: [MIT](LICENSE).
+
 ## What this is
 
 The original `main.c` is a bare-metal RISC-V program (targeting the DE1-SoC
@@ -15,21 +20,34 @@ build.
 
 ## Files
 
-- `main.c` — the original bare-metal program, with one real bug fixed
+```
+board/main.c              original bare-metal program (RISC-V/DE1-SoC only)
+include/orderbook_engine.h  public API + data structures for the extracted engine
+src/orderbook_engine.c      baseline + optimized implementations
+tests/test_correctness.c    200k-tick replay diff + capacity regression tests
+bench/benchmark.c           baseline-vs-optimized timing, mean + percentiles
+Makefile                    test / bench / asan / cppcheck / clean targets
+.github/workflows/ci.yml    runs all of the above on every push/PR
+```
+
+- `board/main.c` — the original bare-metal program, with one real bug fixed
   (see below). This still targets the DE1-SoC and won't compile with a
   normal x86 gcc (it uses RISC-V-specific interrupt attributes and raw
-  hardware addresses on purpose).
-- `orderbook_engine.h` / `orderbook_engine.c` — the order book data
-  structures and matching logic extracted into a platform-independent
+  hardware addresses on purpose). Kept as a historical/reference artifact,
+  not part of the buildable project.
+- `include/orderbook_engine.h` / `src/orderbook_engine.c` — the order book
+  data structures and matching logic extracted into a platform-independent
   form, with two implementations side by side:
   - `*_baseline` — a faithful port of the logic in `main.c`
   - `*_opt` — an optimized version with the same external behavior
-- `test_correctness.c` — replays 200,000 ticks of synthetic market-maker +
-  player activity against both engines and asserts identical account state
-  and book state after every tick. This has to pass before any benchmark
-  number means anything.
-- `benchmark.c` — measures baseline vs optimized under identical workload
-  using `clock_gettime(CLOCK_MONOTONIC)`.
+- `tests/test_correctness.c` — two things: (1) replays 200,000 ticks of
+  synthetic market-maker + player activity against both engines and
+  asserts identical account state and book state after every tick — this
+  has to pass before any benchmark number means anything; (2) a capacity
+  regression test guarding the buffer-overflow bug described below.
+- `bench/benchmark.c` — measures baseline vs optimized under identical
+  workload using `clock_gettime(CLOCK_MONOTONIC)`, reporting both the mean
+  and the p50/p90/p99/p99.9 latency distribution per tick.
 
 ## Bug fixed in `main.c`
 
@@ -42,6 +60,44 @@ error from the line above it. Fixed to:
 ```c
 vga_draw_rect_fast(x + w - 1, y, 1, h, color);
 ```
+
+## A second bug — found and fixed after the extraction, not present in `main.c`
+
+`main.c` never writes into a price level's fixed-size order queue
+(`L3Order queue[MAX_ORDERS_PER_LVL]`) without first checking
+`order_count < MAX_ORDERS_PER_LVL` at the call site — every insertion in
+`process_tick` is guarded that way. When the matching logic was extracted
+into `ob_add_order_opt`, that external guard didn't come with it: the
+function wrote unconditionally to `lvl->queue[lvl->order_count++]`. A price
+level that was already at capacity and received one more insert would
+silently write past the end of the array, into whatever struct field
+follows `queue[]` in `L3PriceLevel` — memory corruption, not necessarily a
+crash, and the kind of bug a correctness harness can miss entirely if its
+synthetic workload never happens to fill a level to exact capacity (the
+200k-tick replay test didn't hit it).
+
+This wasn't a hunch — it was reproduced directly: temporarily reverting the
+fix and running the test binary under `clang -fsanitize=address,undefined`
+gives a concrete `AddressSanitizer: stack-buffer-overflow` at the exact
+insertion line, not a theoretical concern.
+
+**Fix:** move the bounds check inside the function itself instead of
+relying on every caller to remember it externally — `ob_add_order_opt` and
+the new `ob_add_order_baseline` (added for a symmetric, safe API on both
+sides) now return `1`/`0` for accept/reject and refuse to touch `queue[]`
+or `total_qty` at all on rejection. `tests/test_correctness.c` has a
+dedicated regression test that fills a level to exact capacity, attempts
+one more insert, and asserts it's rejected with zero state mutation —
+verified clean via `make asan` (clang; gcc's ASan/UBSan runtime was broken
+on the dev machine this was built on, which is itself a reminder that
+"the sanitizer build passed" is only as good as actually having a working
+sanitizer toolchain — worth checking, not assuming).
+
+The lesson generalizes past this one function: an invariant that's true
+only because every caller happens to check it externally is not actually
+an invariant — it's an accident waiting for the one caller that doesn't.
+Encapsulating the check inside the function that owns the data made it
+true unconditionally instead of true by convention.
 
 ## The optimization
 
@@ -70,20 +126,41 @@ performance number was trusted.
 ## Results (x86_64 dev machine, see caveat below)
 
 ```
-[Full tick loop]
-  baseline : ~150-160 ns/tick
-  optimized: ~120-125 ns/tick
+[Full tick loop, mean]
+  baseline : ~150-185 ns/tick
+  optimized: ~120-150 ns/tick
   speedup  : ~1.2-1.3x
 
+[Full tick loop, tail latency — p50 / p99]
+  baseline : p50 ~166 ns, p99 ~221 ns
+  optimized: p50 ~134 ns, p99 ~178 ns
+  speedup  : ~1.2x at both p50 and p99 (see note below on why this
+             consistency matters)
+
 [clean_ghosts in isolation]
-  baseline : ~12-13 ns/call
+  baseline : ~11-13 ns/call
   optimized: ~10-11 ns/call
-  speedup  : ~1.15-1.22x
+  speedup  : ~1.08-1.22x
 
 [update_total_qty full rescan, isolated, book at max depth]
-  baseline : ~40 ns/call, called once per tick
+  baseline : ~29-40 ns/call, called once per tick
   optimized: removed from hot path entirely (0 ns/tick)
 ```
+
+Run-to-run variance on a shared, non-realtime dev machine is real — hence
+the ranges above rather than a single number. `make bench` prints exact
+figures for the run you actually did; don't quote a number you haven't
+personally reproduced.
+
+**Why the p50/p99 comparison, not just the mean:** a mean can hide a
+regime where the optimized version is faster on typical ticks but has a
+worse tail (e.g. from extra branching or cache pressure introduced by the
+"optimization" itself) — exactly the failure mode that matters most for
+code with a hard per-tick budget, and exactly the kind of thing a single
+average silently launders. Here they move together (~1.2x at both p50 and
+p99), which is itself a finding worth stating: the optimization doesn't
+just win on average, it wins uniformly across the distribution, so there's
+no tail-latency regression hiding behind a better mean.
 
 **Important caveat, stated plainly rather than glossed over:** these
 absolute nanosecond numbers are from an x86_64 dev machine, not the
@@ -106,12 +183,25 @@ came out modest is more valuable than the number itself.
 ## How to run it yourself
 
 ```bash
-gcc -O2 -Wall -Wextra -o test_correctness test_correctness.c orderbook_engine.c
-./test_correctness      # should print PASS
-
-gcc -O2 -Wall -Wextra -o benchmark benchmark.c orderbook_engine.c
-./benchmark              # prints timing comparison
+make test       # build + run the 200k-tick replay + capacity regression tests
+make bench      # runs `make test` first, then builds + runs the benchmark
+make asan       # rebuild the tests with clang -fsanitize=address,undefined and run them
+make cppcheck   # static analysis over src/, bench/, tests/
+make clean      # remove build/
 ```
+
+`bench/benchmark.c` and `tests/test_correctness.c` can also be built
+directly if you don't want to use the Makefile:
+```bash
+gcc -O2 -Wall -Wextra -Iinclude -o test_correctness tests/test_correctness.c src/orderbook_engine.c
+./test_correctness
+
+gcc -O2 -Wall -Wextra -Iinclude -o benchmark bench/benchmark.c src/orderbook_engine.c
+./benchmark
+```
+
+CI (`.github/workflows/ci.yml`) runs all four `make` targets above on
+every push and pull request.
 
 ## How to talk about this project in an interview
 
@@ -120,22 +210,39 @@ A useful narrative arc, in order:
 1. **What it is**: a bare-metal limit order book + matching engine on an
    FPGA board, with real constraints (no malloc, no OS, interrupt-driven
    timing, direct framebuffer writes) — not a toy Python script.
-2. **What you found**: a real bug (wrong argument count/hardcoded
-   coordinate from a copy-paste), and a real inefficiency (a full rescan
-   happening every tick when the information needed was already available
-   incrementally).
+2. **What you found in the original**: a real rendering bug (wrong
+   argument count/hardcoded coordinate from a copy-paste), and a real
+   inefficiency (a full rescan happening every tick when the information
+   needed was already available incrementally).
 3. **What you did about the inefficiency**: designed an incremental-update
    version, and — critically — **did not trust it until it passed a
    correctness harness that replays real workload and diffs state
    tick-by-tick against the original.**
-4. **What you measured, and how you talk about the number**: a real,
-   modest 1.2-1.3x, plus the ability to explain *why* it's modest (small
-   book depth) rather than just reporting an inflated number. Being able to
-   say "here's the benchmark, here's its limitation, here's what would
-   change the result at larger scale" is a stronger signal than a bigger
-   number would be on its own.
+4. **What you found while hardening the extraction itself**: the
+   correctness harness passing is *not* the same as the code being safe —
+   `ob_add_order_opt` had a real out-of-bounds write that 200,000 ticks of
+   replay testing never triggered, because it depended on a level actually
+   reaching exact capacity, which the synthetic workload never happened to
+   do. You only caught it by (a) reasoning about the invariant the
+   extraction silently dropped, and (b) confirming it under a sanitizer
+   rather than trusting the reasoning alone. This is worth leading with in
+   an interview: **a green test suite tells you the paths it exercised are
+   correct, not that the code is correct** — sanitizers, bounds-checking
+   internal to the function that owns the data, and reasoning about what
+   invariants a refactor can silently break are a different, complementary
+   layer of confidence, and knowing when you need that layer (not just
+   "write more tests") is the actual signal.
+5. **What you measured, and how you talk about the number**: a real,
+   modest 1.2-1.3x at both the mean *and* the tail (p50/p99 move together),
+   plus the ability to explain *why* it's modest (small book depth) rather
+   than just reporting an inflated number. Being able to say "here's the
+   benchmark, here's its methodology (percentiles, not just mean, because
+   tail latency is what a hard per-tick budget actually pays for), here's
+   its limitation, here's what would change the result at larger scale" is
+   a stronger signal than a bigger number would be on its own.
 
 This is a much stronger story than "I built a project" — it demonstrates
 the actual discipline (verify before trusting, measure before claiming,
-state limitations honestly) that low-latency/quant infra interviews are
-specifically trying to probe for.
+distinguish "tests pass" from "code is safe," state limitations honestly)
+that low-latency/quant infra interviews are specifically trying to probe
+for.
