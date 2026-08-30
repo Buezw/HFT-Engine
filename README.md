@@ -21,13 +21,14 @@ build.
 ## Files
 
 ```
-board/main.c              original bare-metal program (RISC-V/DE1-SoC only)
-include/orderbook_engine.h  public API + data structures for the extracted engine
-src/orderbook_engine.c      baseline + optimized implementations
-tests/test_correctness.c    200k-tick replay diff + capacity regression tests
-bench/benchmark.c           baseline-vs-optimized timing, mean + percentiles
-Makefile                    test / bench / asan / cppcheck / clean targets
-.github/workflows/ci.yml    runs all of the above on every push/PR
+board/main.c                 original bare-metal program (RISC-V/DE1-SoC only)
+include/orderbook_engine.h   public API + data structures for the extracted engine
+src/orderbook_engine.c       baseline + optimized implementations, limit order lifecycle
+tests/test_correctness.c     200k-tick replay + capacity/lifecycle/randomized-stress tests
+bench/benchmark.c            baseline-vs-optimized timing: mean, percentiles, depth sweep
+scripts/format_depth_sweep.awk  tabulates `make depth-sweep` output
+Makefile                     test / bench / asan / cppcheck / depth-sweep / clean targets
+.github/workflows/ci.yml     runs test / bench / asan / cppcheck on every push/PR
 ```
 
 - `board/main.c` — the original bare-metal program, with one real bug fixed
@@ -40,14 +41,25 @@ Makefile                    test / bench / asan / cppcheck / clean targets
   form, with two implementations side by side:
   - `*_baseline` — a faithful port of the logic in `main.c`
   - `*_opt` — an optimized version with the same external behavior
-- `tests/test_correctness.c` — two things: (1) replays 200,000 ticks of
-  synthetic market-maker + player activity against both engines and
-  asserts identical account state and book state after every tick — this
-  has to pass before any benchmark number means anything; (2) a capacity
-  regression test guarding the buffer-overflow bug described below.
+  - plus a resting player limit-order lifecycle (`ob_place_limit_*`,
+    `ob_cancel_order_*`) that completes a feature `main.c` only half-built
+    (see below) — new in the extracted engine, not a port of anything in
+    `main.c`.
+- `tests/test_correctness.c` — four things, in order: (1) replays 200,000
+  ticks of synthetic market-maker + player activity against both engines
+  and asserts identical account state and book state after every tick —
+  this has to pass before any benchmark number means anything; (2) a
+  capacity regression test guarding the buffer-overflow bug described
+  below; (3) a deterministic test of the limit order lifecycle (place,
+  reserve, invalid rejection, cancel, refund, double-cancel rejection);
+  (4) a 100,000-iteration randomized stress test (fixed-seed PRNG, not
+  `rand()`, for reproducibility across platforms) mixing market orders,
+  placements, and cancels, diffing full state after every operation.
 - `bench/benchmark.c` — measures baseline vs optimized under identical
-  workload using `clock_gettime(CLOCK_MONOTONIC)`, reporting both the mean
-  and the p50/p90/p99/p99.9 latency distribution per tick.
+  workload using `clock_gettime(CLOCK_MONOTONIC)`, reporting the mean,
+  the p50/p90/p99/p99.9 latency distribution per tick, and (via
+  `make depth-sweep`) how the gap between baseline and optimized scales
+  as book depth grows past the board's real value.
 
 ## Bug fixed in `main.c`
 
@@ -98,6 +110,53 @@ only because every caller happens to check it externally is not actually
 an invariant — it's an accident waiting for the one caller that doesn't.
 Encapsulating the check inside the function that owns the data made it
 true unconditionally instead of true by convention.
+
+## A half-built feature, completed: resting player limit orders
+
+`main.c` only ever aggresses the book — `player_market_buy` /
+`player_market_sell` eat resting liquidity immediately, there's no
+function anywhere in the 919-line file that lets the player place a
+resting limit order. And yet `L3Order.is_mine` is *checked* in eight
+places: both market matchers skip `is_mine` orders explicitly ("don't eat
+our own orders"), order rendering colors `is_mine` orders yellow, and
+`player_cancel_all_orders` refunds cash (for bids) or inventory (for
+asks) specifically for `is_mine` orders that are still resting. None of
+that is reachable — `grep -n "is_mine = 1" main.c` returns nothing. The
+refund logic in `player_cancel_all_orders` only makes sense if something
+reserved that cash/inventory when the order was placed, and as shipped,
+nothing does.
+
+This isn't a bug to fix (nothing crashes; the dead branches are just
+inert), but it's a real, half-implemented feature, and completing it in
+the extracted engine — not `main.c`, which stays a verbatim historical
+artifact — is what actually makes `is_mine`, the self-trade exclusion,
+and the cancel-refund logic meaningful instead of dead code:
+
+- `ob_place_limit_buy_*` / `ob_place_limit_sell_*` — reserve cash (buy) or
+  inventory (sell) immediately at placement, same as a real limit order
+  ties up capital the moment it rests in the book, then insert an
+  `is_mine=1` order via the already bounds-checked `ob_add_order_*`.
+  Returns the new order's id, or `-1` for an invalid level, non-positive
+  qty, oversold inventory, or a full queue — nothing is reserved on
+  failure.
+- `ob_cancel_order_*` — cancel a single resting order by id, anywhere in
+  the book, refunding exactly what was reserved. Deliberately an
+  `O(orders)` linear scan across the whole book rather than an indexed
+  lookup: book size is capped at `MAX_PRICE_LEVELS * MAX_ORDERS_PER_LVL *
+  2` (60 orders at the board's real depth), so a scan is a handful of
+  cache-line reads — not worth an `order_id -> location` index without
+  evidence (profiling) that this is ever hot. Stated explicitly rather
+  than silently over-engineered: a real production engine handling
+  unbounded depth would want that index; this one doesn't need it yet.
+
+Tested two ways: a deterministic test walks through placement,
+reservation, invalid-input rejection, cancel, exact refund, and
+double-cancel rejection; a 100,000-iteration randomized stress test
+(fixed-seed `xorshift32`, not `rand()`, so the exact same sequence
+reproduces on any platform) mixes market orders, placements, and cancels
+— including cancelling ids that were never issued or were already
+filled — and diffs full baseline-vs-opt state after *every single
+operation*, not periodically. Both clean under `make asan`.
 
 ## The optimization
 
@@ -169,25 +228,48 @@ cache hierarchy, different clock speed. The *relative* speedup is the
 meaningful takeaway, since both variants ran the same instructions (modulo
 the actual algorithmic difference) on the same machine in the same run.
 
-**The honest limitation of this result:** the book depth in this project is
-intentionally small (`MAX_PRICE_LEVELS=3`, `MAX_ORDERS_PER_LVL=10` — a
-deliberate design choice to fit VRAM/CPU budget on the FPGA board), so a
-per-level O(n) scan is only ever a scan over ~10 elements. That's why the
-speedup is a modest 1.2-1.3x rather than an order of magnitude: removing an
-O(n) rescan matters a lot more as book depth grows, and matters less when n
-is already small. This is exactly the kind of trade-off worth stating
-explicitly in an interview — not every "obviously correct" optimization
-produces a dramatic number at small scale, and knowing *why* a benchmark
-came out modest is more valuable than the number itself.
+**The honest limitation of this result — and the measurement that backs
+it up:** the book depth in this project is intentionally small
+(`MAX_PRICE_LEVELS=3`, `MAX_ORDERS_PER_LVL=10` — a deliberate design
+choice to fit VRAM/CPU budget on the FPGA board), so a per-level O(n) scan
+is only ever a scan over ~10 elements. That's the whole reason the speedup
+above is a modest 1.2-1.4x rather than an order of magnitude. That claim
+used to just be asserted; `make depth-sweep` (see below) now measures it
+by recompiling the benchmark at several depths via `-DMAX_ORDERS_PER_LVL`
+and tabulating the baseline-vs-optimized gap at each:
+
+```
+depth     mean_ns_base    mean_ns_opt    mean_x     p50_x     p99_x rescan_ns/call
+-----     ------------    -----------    ------     -----     ----- --------------
+10               208.0          150.9     1.38x     1.39x     1.48x           29.9
+25               283.5          202.5     1.40x     1.43x     1.41x           88.7
+50               421.5          285.0     1.48x     1.52x     1.47x          148.6
+100             1024.4          462.4     2.22x     2.27x     2.23x          524.4
+200             1871.6          783.9     2.39x     2.42x     2.39x          985.6
+400             3545.3         1422.9     2.49x     2.51x     2.50x         1963.6
+```
+
+At the board's real depth (10), the optimization is worth 1.38x. At 40x
+that depth, it's worth 2.49x — nearly double the speedup, tracking the
+`O(n)` rescan cost (`rescan_ns/call`) scaling roughly linearly with `n`
+(10→400 is 40x depth, ~29.9ns→~1964ns is ~66x rescan cost — slightly
+superlinear, plausibly cache effects once a level's queue no longer fits
+comfortably in a few cache lines, not investigated further here). This is
+exactly the kind of trade-off worth stating explicitly in an interview —
+not every "obviously correct" optimization produces a dramatic number at
+small scale, a benchmark that only ran at the shipped configuration
+wouldn't have shown *why* it's modest, and now there's a table instead of
+an assertion.
 
 ## How to run it yourself
 
 ```bash
-make test       # build + run the 200k-tick replay + capacity regression tests
-make bench      # runs `make test` first, then builds + runs the benchmark
-make asan       # rebuild the tests with clang -fsanitize=address,undefined and run them
-make cppcheck   # static analysis over src/, bench/, tests/
-make clean      # remove build/
+make test         # build + run the replay, capacity, lifecycle, and stress tests
+make bench        # runs `make test` first, then builds + runs the benchmark
+make asan         # rebuild the tests with clang -fsanitize=address,undefined and run them
+make cppcheck     # static analysis over src/, bench/, tests/
+make depth-sweep  # ~35s: the table in the Results section above, regenerated live
+make clean        # remove build/
 ```
 
 `bench/benchmark.c` and `tests/test_correctness.c` can also be built
@@ -200,8 +282,10 @@ gcc -O2 -Wall -Wextra -Iinclude -o benchmark bench/benchmark.c src/orderbook_eng
 ./benchmark
 ```
 
-CI (`.github/workflows/ci.yml`) runs all four `make` targets above on
-every push and pull request.
+CI (`.github/workflows/ci.yml`) runs `test`/`bench`/`asan`/`cppcheck` on
+every push and pull request (`depth-sweep` is not in CI — it's a
+deliberately slow, occasional-use target, not something that should gate
+every commit).
 
 ## How to talk about this project in an interview
 
@@ -233,13 +317,26 @@ A useful narrative arc, in order:
    layer of confidence, and knowing when you need that layer (not just
    "write more tests") is the actual signal.
 5. **What you measured, and how you talk about the number**: a real,
-   modest 1.2-1.3x at both the mean *and* the tail (p50/p99 move together),
-   plus the ability to explain *why* it's modest (small book depth) rather
-   than just reporting an inflated number. Being able to say "here's the
-   benchmark, here's its methodology (percentiles, not just mean, because
-   tail latency is what a hard per-tick budget actually pays for), here's
-   its limitation, here's what would change the result at larger scale" is
-   a stronger signal than a bigger number would be on its own.
+   modest 1.2-1.4x at the board's actual depth, at both the mean *and* the
+   tail (p50/p99 move together) — and then, rather than stopping at
+   "here's why it's modest" as an unverified claim, **you measured the
+   claim itself**: `make depth-sweep` recompiles the same benchmark at
+   depths up to 40x the board's, and the speedup climbs to 2.5x, tracking
+   the isolated rescan cost scaling with depth. Being able to say "here's
+   the benchmark, here's its methodology (percentiles, not just mean),
+   here's the limitation, and here's the swept data that confirms *why*
+   it's a limitation instead of just asserting it" is a stronger signal
+   than a bigger number would be on its own.
+6. **What you noticed that wasn't a bug**: `main.c` checks
+   `L3Order.is_mine` in eight places but never sets it — a real,
+   half-implemented feature (resting player limit orders), not a crash or
+   a wrong number. Recognizing "this code path is unreachable, and here's
+   the grep that proves it" is a different skill than finding a crash,
+   and completing it in the extracted engine (with its own place/cancel
+   API, tested both deterministically and via 100k iterations of
+   randomized fuzzing against a fixed-seed PRNG) is a chance to show you
+   can extend a matching engine's actual domain logic — order lifecycle,
+   not just "make the loop faster" — correctly.
 
 This is a much stronger story than "I built a project" — it demonstrates
 the actual discipline (verify before trusting, measure before claiming,
