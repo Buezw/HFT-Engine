@@ -27,6 +27,12 @@
 #define MAX_ORDERS_PER_LVL 10
 #endif
 #define INITIAL_CAPITAL    500000
+// Pre-trade position limit for the player's own risk-checked market
+// orders (see ob_market_*_risk_checked_* below). Not present in main.c —
+// main.c's player_market_sell has no floor at all; a random 100k-op
+// stress test against the raw engine drove my_inventory to -168,805
+// with zero pushback, which is what motivated adding this.
+#define MAX_POSITION       500
 
 typedef struct {
     int order_id;
@@ -138,5 +144,35 @@ int ob_place_limit_sell_opt     (L3OrderBook *ob, EngineAccount *acc, int level,
 // scan is ever hot, at this depth.
 int ob_cancel_order_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id);
 int ob_cancel_order_opt     (L3OrderBook *ob, EngineAccount *acc, int order_id);
+
+// ----------------------------------------------------------------------
+// Pre-trade risk limit for the player's own market orders.
+//
+// main.c's player_market_buy/player_market_sell have no position check
+// at all — a real (unconstrained) test run against this engine's raw
+// ob_market_sell_*(..., is_player=1) drove my_inventory to -168,805 over
+// 100,000 random operations with nothing stopping it. Real venues call
+// this a pre-trade position/fat-finger limit: the last check before an
+// order is allowed to add more risk than the desk is willing to carry.
+//
+// These wrap ob_market_buy_*/ob_market_sell_* (unchanged, still exactly
+// main.c's behavior — is_player=1 fills, no limit) rather than modifying
+// them: main.c's ported functions need to keep being a faithful port,
+// since the correctness harness's whole methodology depends on baseline
+// staying baseline. The risk check is a layer on top, not a change to
+// what "baseline" means.
+//
+// Behavior: clips the requested qty down to whatever room remains under
+// MAX_POSITION before it touches the book (reduce, don't bounce) — mirrors
+// how real pre-trade size limiters behave. Returns the qty actually
+// submitted to matching, which may be less than requested, or 0 if
+// already at the limit (0 is not an error; it means "no trade happened,
+// on purpose"). Only meaningful for the player's own position — the
+// market-maker/noise side of the simulated book (is_player=0 fills) is
+// not the desk's own risk and is intentionally not gated here.
+int ob_market_buy_risk_checked_baseline (L3OrderBook *ob, EngineAccount *acc, int qty);
+int ob_market_buy_risk_checked_opt      (L3OrderBook *ob, EngineAccount *acc, int qty);
+int ob_market_sell_risk_checked_baseline(L3OrderBook *ob, EngineAccount *acc, int qty);
+int ob_market_sell_risk_checked_opt     (L3OrderBook *ob, EngineAccount *acc, int qty);
 
 #endif // ORDERBOOK_ENGINE_H

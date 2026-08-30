@@ -422,3 +422,42 @@ int ob_cancel_order_opt(L3OrderBook *ob, EngineAccount *acc, int order_id) {
     }
     return 1;
 }
+
+// ============================================================================
+// PRE-TRADE RISK LIMIT — a layer on top of ob_market_buy_*/ob_market_sell_*,
+// not a change to them. See header comment for the -168,805 stress-test
+// result that motivated this and why it wraps rather than modifies the
+// baseline-faithful matching functions.
+// ============================================================================
+
+int ob_market_buy_risk_checked_baseline(L3OrderBook *ob, EngineAccount *acc, int qty) {
+    int room = MAX_POSITION - acc->my_inventory;
+    if (room <= 0) return 0; // already at/over the long limit; no trade, not an error
+    int clipped = (qty < room) ? qty : room;
+    ob_market_buy_baseline(ob, acc, clipped, /*is_player=*/1);
+    return clipped;
+}
+
+int ob_market_buy_risk_checked_opt(L3OrderBook *ob, EngineAccount *acc, int qty) {
+    int room = MAX_POSITION - acc->my_inventory;
+    if (room <= 0) return 0;
+    int clipped = (qty < room) ? qty : room;
+    ob_market_buy_opt(ob, acc, clipped, /*is_player=*/1);
+    return clipped;
+}
+
+int ob_market_sell_risk_checked_baseline(L3OrderBook *ob, EngineAccount *acc, int qty) {
+    int room = MAX_POSITION + acc->my_inventory; // symmetric: how far from -MAX_POSITION
+    if (room <= 0) return 0;
+    int clipped = (qty < room) ? qty : room;
+    ob_market_sell_baseline(ob, acc, clipped, /*is_player=*/1);
+    return clipped;
+}
+
+int ob_market_sell_risk_checked_opt(L3OrderBook *ob, EngineAccount *acc, int qty) {
+    int room = MAX_POSITION + acc->my_inventory;
+    if (room <= 0) return 0;
+    int clipped = (qty < room) ? qty : room;
+    ob_market_sell_opt(ob, acc, clipped, /*is_player=*/1);
+    return clipped;
+}

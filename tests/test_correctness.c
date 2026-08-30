@@ -449,12 +449,165 @@ static int test_random_stress(void) {
     return fails;
 }
 
+// ============================================================================
+// Test 5: pre-trade position risk limit.
+//
+// main.c's player_market_sell has no position floor at all — test_random_stress
+// above (which calls the RAW, unwrapped ob_market_sell_*) drove my_inventory to
+// -168,805 over 100k operations with nothing stopping it. ob_market_buy/sell_
+// risk_checked_* wrap the same matching functions with a pre-trade clip to
+// MAX_POSITION instead of modifying them (see header comment for why: baseline
+// has to stay a faithful port for the whole correctness methodology to mean
+// anything).
+//
+// Two tests: the clipping arithmetic in isolation (drive my_inventory to a
+// known distance from the boundary directly, so this doesn't depend on the
+// book having enough liquidity to fill any particular amount), and an
+// end-to-end randomized run asserting the invariant |my_inventory| <=
+// MAX_POSITION actually holds through real matching, not just in the
+// wrapper's arithmetic.
+// ============================================================================
+static int test_risk_limit_clipping(void) {
+    int fails = 0;
+    L3OrderBook ob; EngineAccount acc;
+
+    // Near the long limit: only 5 units of room should get through, no
+    // matter how much was requested or how much the book could fill.
+    ob_init_opt(&ob, &acc, 100);
+    acc.my_inventory = MAX_POSITION - 5;
+    int sub = ob_market_buy_risk_checked_opt(&ob, &acc, 9999);
+    if (sub != 5) {
+        printf("FAIL: risk-checked buy 5 units from the long limit submitted %d, expected 5\n", sub);
+        fails++;
+    }
+
+    // Exactly at the limit: zero room. 0 submitted is success, not an
+    // error — the check did exactly its job.
+    ob_init_opt(&ob, &acc, 100);
+    acc.my_inventory = MAX_POSITION;
+    sub = ob_market_buy_risk_checked_opt(&ob, &acc, 10);
+    if (sub != 0 || acc.my_inventory != MAX_POSITION) {
+        printf("FAIL: risk-checked buy exactly at the limit submitted %d (inventory now %d), "
+               "expected 0 submitted and inventory unchanged\n", sub, acc.my_inventory);
+        fails++;
+    }
+
+    // Symmetric on the short side.
+    ob_init_opt(&ob, &acc, 100);
+    acc.my_inventory = -(MAX_POSITION - 7);
+    sub = ob_market_sell_risk_checked_opt(&ob, &acc, 9999);
+    if (sub != 7) {
+        printf("FAIL: risk-checked sell 7 units from the short limit submitted %d, expected 7\n", sub);
+        fails++;
+    }
+
+    // Well within room: this is a limiter, not something that always
+    // clips — a small request must pass through unchanged.
+    ob_init_opt(&ob, &acc, 100);
+    acc.my_inventory = 0;
+    sub = ob_market_buy_risk_checked_opt(&ob, &acc, 3);
+    if (sub != 3) {
+        printf("FAIL: risk-checked buy well within room clipped a 3-unit request to %d\n", sub);
+        fails++;
+    }
+
+    // Baseline must clip identically to opt.
+    ob_init_baseline(&ob, &acc, 100);
+    acc.my_inventory = MAX_POSITION - 5;
+    sub = ob_market_buy_risk_checked_baseline(&ob, &acc, 9999);
+    if (sub != 5) {
+        printf("FAIL: baseline risk-checked buy 5 units from the long limit submitted %d, expected 5\n", sub);
+        fails++;
+    }
+    ob_init_baseline(&ob, &acc, 100);
+    acc.my_inventory = -(MAX_POSITION - 7);
+    sub = ob_market_sell_risk_checked_baseline(&ob, &acc, 9999);
+    if (sub != 7) {
+        printf("FAIL: baseline risk-checked sell 7 units from the short limit submitted %d, expected 7\n", sub);
+        fails++;
+    }
+
+    if (fails == 0) {
+        printf("PASS: risk-limit clipping arithmetic (near-limit, exactly-at-limit, "
+               "within-room, both sides, baseline and opt) all correct\n");
+    }
+    return fails;
+}
+
+static int test_risk_limit_end_to_end(void) {
+    L3OrderBook ob_base, ob_opt;
+    EngineAccount acc_base, acc_opt;
+    ob_init_baseline(&ob_base, &acc_base, 100);
+    ob_init_opt(&ob_opt, &acc_opt, 100);
+
+    rng_state = 0xBADA55u; // different fixed seed from test_random_stress, still reproducible
+    int fails = 0;
+    const int ITERATIONS = 20000;
+
+    for (int i = 0; i < ITERATIONS && fails == 0; i++) {
+        // Keep the book stocked so risk-checked orders have real liquidity
+        // to walk into, same market-maker pattern used elsewhere.
+        for (int lvl = 0; lvl < MAX_PRICE_LEVELS; lvl++) {
+            int qb = rand_range(10, 40);
+            ob_add_order_baseline(&ob_base.bids[lvl], (L3Order){acc_base.global_order_id++, qb, 0, 0, 1});
+            ob_add_order_opt(&ob_opt.bids[lvl], (L3Order){acc_opt.global_order_id++, qb, 0, 0, 1});
+            int qa = rand_range(10, 40);
+            ob_add_order_baseline(&ob_base.asks[lvl], (L3Order){acc_base.global_order_id++, qa, 0, 0, 1});
+            ob_add_order_opt(&ob_opt.asks[lvl], (L3Order){acc_opt.global_order_id++, qa, 0, 0, 1});
+        }
+
+        int qty = rand_range(1, 60); // deliberately can exceed MAX_POSITION in a single call
+        int sub_base, sub_opt;
+        if (rand_range(0, 1)) {
+            sub_base = ob_market_buy_risk_checked_baseline(&ob_base, &acc_base, qty);
+            sub_opt  = ob_market_buy_risk_checked_opt(&ob_opt, &acc_opt, qty);
+        } else {
+            sub_base = ob_market_sell_risk_checked_baseline(&ob_base, &acc_base, qty);
+            sub_opt  = ob_market_sell_risk_checked_opt(&ob_opt, &acc_opt, qty);
+        }
+        if (sub_base != sub_opt) {
+            printf("FAIL at iter %d: risk-checked submitted qty diverged (base=%d opt=%d)\n",
+                   i, sub_base, sub_opt);
+            fails++;
+        }
+        if (acc_base.my_inventory > MAX_POSITION || acc_base.my_inventory < -MAX_POSITION ||
+            acc_opt.my_inventory  > MAX_POSITION || acc_opt.my_inventory  < -MAX_POSITION) {
+            printf("FAIL at iter %d: position limit breached (base inv=%d, opt inv=%d, limit=%d)\n",
+                   i, acc_base.my_inventory, acc_opt.my_inventory, MAX_POSITION);
+            fails++;
+        }
+
+        for (int lvl = 0; lvl < MAX_PRICE_LEVELS; lvl++) {
+            ob_clean_ghosts_baseline(&ob_base.bids[lvl]);
+            ob_clean_ghosts_opt(&ob_opt.bids[lvl]);
+            ob_clean_ghosts_baseline(&ob_base.asks[lvl]);
+            ob_clean_ghosts_opt(&ob_opt.asks[lvl]);
+        }
+        ob_update_total_qty_baseline(&ob_base);
+
+        if (!accounts_equal(&acc_base, &acc_opt) || !books_equal(&ob_base, &ob_opt)) {
+            printf("FAIL at iter %d: baseline/opt diverged under risk-checked trading\n", i);
+            fails++;
+        }
+    }
+
+    if (fails == 0) {
+        printf("PASS: %d risk-checked market orders, |inventory| never exceeded "
+               "MAX_POSITION=%d on either engine, baseline and opt stayed identical "
+               "(final inventory base=%d opt=%d)\n",
+               ITERATIONS, MAX_POSITION, acc_base.my_inventory, acc_opt.my_inventory);
+    }
+    return fails;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_tick_replay();
     failures += test_capacity_bounds();
     failures += test_limit_order_lifecycle();
     failures += test_random_stress();
+    failures += test_risk_limit_clipping();
+    failures += test_risk_limit_end_to_end();
 
     if (failures == 0) {
         printf("\nALL TESTS PASSED\n");
