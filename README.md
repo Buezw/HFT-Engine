@@ -23,8 +23,8 @@ build.
 ```
 board/main.c                 original bare-metal program (RISC-V/DE1-SoC only)
 include/orderbook_engine.h   public API + data structures for the extracted engine
-src/orderbook_engine.c       baseline + optimized implementations, limit order lifecycle
-tests/test_correctness.c     200k-tick replay + capacity/lifecycle/randomized-stress tests
+src/orderbook_engine.c       baseline + optimized implementations, limit order lifecycle, risk limit
+tests/test_correctness.c     200k-tick replay + capacity/lifecycle/stress/risk-limit tests
 bench/benchmark.c            baseline-vs-optimized timing: mean, percentiles, depth sweep
 scripts/format_depth_sweep.awk  tabulates `make depth-sweep` output
 Makefile                     test / bench / asan / cppcheck / depth-sweep / clean targets
@@ -43,9 +43,10 @@ Makefile                     test / bench / asan / cppcheck / depth-sweep / clea
   - `*_opt` — an optimized version with the same external behavior
   - plus a resting player limit-order lifecycle (`ob_place_limit_*`,
     `ob_cancel_order_*`) that completes a feature `main.c` only half-built
-    (see below) — new in the extracted engine, not a port of anything in
-    `main.c`.
-- `tests/test_correctness.c` — four things, in order: (1) replays 200,000
+    (see below), and a pre-trade position risk limit
+    (`ob_market_*_risk_checked_*`) — both new in the extracted engine, not
+    ports of anything in `main.c`.
+- `tests/test_correctness.c` — six things, in order: (1) replays 200,000
   ticks of synthetic market-maker + player activity against both engines
   and asserts identical account state and book state after every tick —
   this has to pass before any benchmark number means anything; (2) a
@@ -54,7 +55,10 @@ Makefile                     test / bench / asan / cppcheck / depth-sweep / clea
   reserve, invalid rejection, cancel, refund, double-cancel rejection);
   (4) a 100,000-iteration randomized stress test (fixed-seed PRNG, not
   `rand()`, for reproducibility across platforms) mixing market orders,
-  placements, and cancels, diffing full state after every operation.
+  placements, and cancels, diffing full state after every operation; (5)
+  risk-limit clipping arithmetic in isolation; (6) a 20,000-iteration
+  randomized run asserting the position limit invariant holds through
+  real matching on both engines.
 - `bench/benchmark.c` — measures baseline vs optimized under identical
   workload using `clock_gettime(CLOCK_MONOTONIC)`, reporting the mean,
   the p50/p90/p99/p99.9 latency distribution per tick, and (via
@@ -157,6 +161,43 @@ reproduces on any platform) mixes market orders, placements, and cancels
 — including cancelling ids that were never issued or were already
 filled — and diffs full baseline-vs-opt state after *every single
 operation*, not periodically. Both clean under `make asan`.
+
+## A gap the stress test exposed: no pre-trade risk limit
+
+That 100,000-iteration randomized stress test above is doing something
+useful beyond checking baseline vs opt agree: it's also just running the
+*real* engine with no artificial restraint, and what it found is that
+`player_market_sell` — faithfully ported from `main.c`, which has no
+position floor at all — will drive `my_inventory` as far negative as the
+random workload pushes it. In that specific test run, unconstrained,
+100,000 operations left it at **-168,805**. Nothing in `main.c` or the
+ported engine stops that; it's not a bug (the original game never claimed
+to have risk controls), but it's exactly the kind of gap a real venue
+would never ship with.
+
+Added `ob_market_buy_risk_checked_*` / `ob_market_sell_risk_checked_*` —
+thin wrappers around the existing, *unmodified* `ob_market_buy_opt` /
+`ob_market_sell_baseline` etc. — that clip the requested qty down to
+whatever room remains under a `MAX_POSITION` limit (currently 500, either
+direction) before it ever touches the book. Deliberately a wrapper, not a
+change to the underlying functions: those have to stay a faithful,
+unmodified port of `main.c` for the whole baseline-vs-opt diffing
+methodology in this project to keep meaning what it's supposed to mean —
+"the risk check is a new layer, not a redefinition of what baseline is"
+is the same discipline as the limit-order lifecycle work above, applied
+again here. It clips rather than rejects outright (0 submitted is a valid
+outcome, not an error) — mirrors how real pre-trade size limiters
+typically behave: reduce the order to what's allowed, don't just bounce
+it. Only gates the player's own fills; the simulated market-maker/noise
+side of the book isn't the desk's own risk and isn't limited.
+
+Tested by directly setting `my_inventory` to known distances from the
+boundary and checking the clipping arithmetic in isolation (so it doesn't
+depend on the book having any particular amount of liquidity to fill),
+and by a second 20,000-iteration randomized run — same style as the
+stress test above, but this time asserting `|my_inventory| <=
+MAX_POSITION` after every single risk-checked call, on both engines. It
+holds.
 
 ## The optimization
 
@@ -337,6 +378,19 @@ A useful narrative arc, in order:
    randomized fuzzing against a fixed-seed PRNG) is a chance to show you
    can extend a matching engine's actual domain logic — order lifecycle,
    not just "make the loop faster" — correctly.
+7. **What the stress test found beyond baseline-vs-opt agreement**: the
+   same 100k-iteration randomized test built to verify the optimization
+   also, incidentally, revealed that unconstrained player selling drives
+   `my_inventory` to -168,805 with nothing stopping it — because that's
+   just what `main.c`'s logic does, faithfully ported. Adding a pre-trade
+   position limit as a *wrapper* around the existing matching functions
+   (not a modification to them) is a small, deliberate design choice worth
+   explaining on its own: it keeps "baseline" meaning "an unmodified,
+   verifiable port of the original," while still being able to demonstrate
+   risk-control thinking — the layer a real venue would never ship
+   without — on top of it. Being able to say why you *didn't* just add an
+   `if` statement inside the existing function is as much the signal as
+   the risk check itself.
 
 This is a much stronger story than "I built a project" — it demonstrates
 the actual discipline (verify before trusting, measure before claiming,
