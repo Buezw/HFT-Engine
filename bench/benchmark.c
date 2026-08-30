@@ -24,6 +24,12 @@
 // machine, in the same run. Report the ratio, not the absolute ns, when
 // talking about what this proves for the bare-metal target.
 // ============================================================================
+
+// clock_gettime/CLOCK_MONOTONIC are POSIX, not ISO C — invisible under
+// strict -std=c11 without this feature-test macro (must be defined before
+// any system header is included, hence its position here).
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>

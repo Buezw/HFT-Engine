@@ -19,7 +19,13 @@
 #include <stdint.h>
 
 #define MAX_PRICE_LEVELS   3
+// Overridable via -DMAX_ORDERS_PER_LVL=N at compile time (see
+// `make depth-sweep`), to measure how the clean_ghosts/update_total_qty
+// optimizations scale as book depth grows past the board's real value of
+// 10 — without touching this file for every depth tested.
+#ifndef MAX_ORDERS_PER_LVL
 #define MAX_ORDERS_PER_LVL 10
+#endif
 #define INITIAL_CAPITAL    500000
 
 typedef struct {
@@ -86,5 +92,51 @@ int   ob_add_order_opt(L3PriceLevel *lvl, L3Order order);
 // deliberately does NOT touch total_qty here — it stays correct only after
 // the next ob_update_total_qty_baseline() full rescan, matching main.c.
 int   ob_add_order_baseline(L3PriceLevel *lvl, L3Order order);
+
+// ----------------------------------------------------------------------
+// Resting player limit-order lifecycle (place + cancel-by-id).
+//
+// NOT present in main.c as a callable function. main.c's L3Order.is_mine
+// is *checked* in eight places (self-trade exclusion in the market-order
+// matchers, order rendering color, player_cancel_all_orders) but never
+// *set* to 1 anywhere in that 919-line file — grep for `is_mine = 1`
+// comes back empty. player_cancel_all_orders's cash/inventory refund
+// logic implies a "reserve on placement, refund on cancel" model that,
+// as shipped, has no placement function to pair with it: a real, if
+// incomplete, feature.
+//
+// The functions below complete that lifecycle inside the portable engine
+// (not board/main.c, which stays a verbatim historical artifact): reserve
+// cash/inventory at placement, insert an is_mine=1 resting order, and
+// cancel-by-id refunds exactly what was reserved. This is what actually
+// makes is_mine, the self-trade exclusion, and player_cancel_all_orders's
+// refund logic meaningful instead of dead branches.
+// ----------------------------------------------------------------------
+
+// Places a resting is_mine buy at bids[level] / sell at asks[level] for
+// `qty`, reserving cash (buy) or inventory (sell) immediately, same as a
+// real limit order ties up capital the moment it rests in the book.
+// Returns the new order's id (>=0) on success, -1 if level is out of
+// range, qty <= 0, or the level's queue is already full (nothing
+// reserved on failure).
+int ob_place_limit_buy_baseline (L3OrderBook *ob, EngineAccount *acc, int level, int qty);
+int ob_place_limit_buy_opt      (L3OrderBook *ob, EngineAccount *acc, int level, int qty);
+int ob_place_limit_sell_baseline(L3OrderBook *ob, EngineAccount *acc, int level, int qty);
+int ob_place_limit_sell_opt     (L3OrderBook *ob, EngineAccount *acc, int level, int qty);
+
+// Cancels a single resting is_mine order by id, wherever it sits in the
+// book (bids or asks, any level), refunding the cash/inventory reserved
+// at placement. Returns 1 if found and cancelled, 0 if not found (already
+// filled, already cancelled, or an id that never existed / isn't ours).
+//
+// O(orders) linear scan across the whole book. Deliberately not indexed:
+// book size is capped at MAX_PRICE_LEVELS * MAX_ORDERS_PER_LVL * 2 orders
+// (60 at the board's real depth), so a scan is a handful of cache-line
+// reads, not a bottleneck. A production engine handling unbounded depth
+// would maintain an order_id -> (side, level, index) map for O(1) cancel;
+// not worth the complexity here without evidence (profiling) that this
+// scan is ever hot, at this depth.
+int ob_cancel_order_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id);
+int ob_cancel_order_opt     (L3OrderBook *ob, EngineAccount *acc, int order_id);
 
 #endif // ORDERBOOK_ENGINE_H

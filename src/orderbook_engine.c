@@ -317,3 +317,108 @@ void ob_init_opt(L3OrderBook *ob, EngineAccount *acc, int base_price) {
     }
     ob_update_total_qty_opt(ob); // one-time full computation at init is fine
 }
+
+// ============================================================================
+// RESTING PLAYER LIMIT ORDERS — completes the is_mine lifecycle that
+// main.c checks but never populates (see header comment for the full
+// story). Not a port of anything in main.c; a deliberate, clearly-scoped
+// extension of the extracted engine.
+// ============================================================================
+
+int ob_place_limit_buy_baseline(L3OrderBook *ob, EngineAccount *acc, int level, int qty) {
+    if (level < 0 || level >= MAX_PRICE_LEVELS || qty <= 0) return -1;
+    int id = acc->global_order_id;
+    L3Order order = {id, qty, 0, /*is_mine=*/1, 0};
+    if (!ob_add_order_baseline(&ob->bids[level], order)) return -1;
+    acc->global_order_id++;
+    acc->my_cash -= (long)qty * ob->bids[level].price; // reserved, same as main.c's cancel refund implies
+    return id;
+}
+
+int ob_place_limit_buy_opt(L3OrderBook *ob, EngineAccount *acc, int level, int qty) {
+    if (level < 0 || level >= MAX_PRICE_LEVELS || qty <= 0) return -1;
+    int id = acc->global_order_id;
+    L3Order order = {id, qty, 0, /*is_mine=*/1, 0};
+    if (!ob_add_order_opt(&ob->bids[level], order)) return -1; // total_qty updated incrementally inside
+    acc->global_order_id++;
+    acc->my_cash -= (long)qty * ob->bids[level].price;
+    return id;
+}
+
+int ob_place_limit_sell_baseline(L3OrderBook *ob, EngineAccount *acc, int level, int qty) {
+    if (level < 0 || level >= MAX_PRICE_LEVELS || qty <= 0) return -1;
+    if (qty > acc->my_inventory) return -1; // can't sell inventory you don't have
+    int id = acc->global_order_id;
+    L3Order order = {id, qty, 0, /*is_mine=*/1, 0};
+    if (!ob_add_order_baseline(&ob->asks[level], order)) return -1;
+    acc->global_order_id++;
+    acc->my_inventory -= qty;
+    return id;
+}
+
+int ob_place_limit_sell_opt(L3OrderBook *ob, EngineAccount *acc, int level, int qty) {
+    if (level < 0 || level >= MAX_PRICE_LEVELS || qty <= 0) return -1;
+    if (qty > acc->my_inventory) return -1;
+    int id = acc->global_order_id;
+    L3Order order = {id, qty, 0, /*is_mine=*/1, 0};
+    if (!ob_add_order_opt(&ob->asks[level], order)) return -1;
+    acc->global_order_id++;
+    acc->my_inventory -= qty;
+    return id;
+}
+
+// Shared linear scan: both bids and asks, all levels, for a live (not yet
+// ghosted/filled) is_mine order with this id. See header for why this is
+// deliberately O(orders) rather than indexed.
+static L3Order *find_live_mine_order(L3OrderBook *ob, int order_id, int *out_is_bid, int *out_level) {
+    for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
+        for (int q = 0; q < ob->bids[i].order_count; q++) {
+            L3Order *o = &ob->bids[i].queue[q];
+            if (o->order_id == order_id && o->is_mine && o->qty > 0 && o->visual_fx != 2) {
+                *out_is_bid = 1; *out_level = i; return o;
+            }
+        }
+        for (int q = 0; q < ob->asks[i].order_count; q++) {
+            L3Order *o = &ob->asks[i].queue[q];
+            if (o->order_id == order_id && o->is_mine && o->qty > 0 && o->visual_fx != 2) {
+                *out_is_bid = 0; *out_level = i; return o;
+            }
+        }
+    }
+    return NULL;
+}
+
+int ob_cancel_order_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id) {
+    int is_bid, level;
+    L3Order *o = find_live_mine_order(ob, order_id, &is_bid, &level);
+    if (!o) return 0;
+
+    int qty = o->qty;
+    o->ghost_qty = qty;
+    o->qty = 0;
+    o->visual_fx = 2; // same ghost mechanism a full fill uses; ob_clean_ghosts_* compacts it out later
+
+    if (is_bid) acc->my_cash += (long)qty * ob->bids[level].price;
+    else        acc->my_inventory += qty;
+    return 1;
+}
+
+int ob_cancel_order_opt(L3OrderBook *ob, EngineAccount *acc, int order_id) {
+    int is_bid, level;
+    L3Order *o = find_live_mine_order(ob, order_id, &is_bid, &level);
+    if (!o) return 0;
+
+    int qty = o->qty;
+    o->ghost_qty = qty;
+    o->qty = 0;
+    o->visual_fx = 2;
+
+    if (is_bid) {
+        acc->my_cash += (long)qty * ob->bids[level].price;
+        ob->bids[level].total_qty -= qty; // incremental, matches ob_market_*_opt's pattern
+    } else {
+        acc->my_inventory += qty;
+        ob->asks[level].total_qty -= qty;
+    }
+    return 1;
+}
