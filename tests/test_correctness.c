@@ -22,7 +22,10 @@ static int accounts_equal(const EngineAccount *a, const EngineAccount *b) {
            a->total_fill_volume == b->total_fill_volume;
 }
 
-int main(void) {
+// ============================================================================
+// Test 1: 200k-tick behavioral replay, baseline vs opt (original test).
+// ============================================================================
+static int test_tick_replay(void) {
     L3OrderBook ob_base, ob_opt;
     EngineAccount acc_base, acc_opt;
 
@@ -43,20 +46,17 @@ int main(void) {
         // into one side, then ghosts get cleaned.
         if (t % 2 == 0) {
             for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
-                if (ob_base.bids[i].order_count < MAX_ORDERS_PER_LVL) {
-                    int q = (t * 13 + i * 7) % 40 + 10;
-                    ob_base.bids[i].queue[ob_base.bids[i].order_count++] =
-                        (L3Order){acc_base.global_order_id++, q, 0, 0, 1};
-                    ob_add_order_opt(&ob_opt.bids[i],
-                        (L3Order){acc_opt.global_order_id++, q, 0, 0, 1});
-                }
-                if (ob_base.asks[i].order_count < MAX_ORDERS_PER_LVL) {
-                    int q = (t * 17 + i * 11) % 40 + 10;
-                    ob_base.asks[i].queue[ob_base.asks[i].order_count++] =
-                        (L3Order){acc_base.global_order_id++, q, 0, 0, 1};
-                    ob_add_order_opt(&ob_opt.asks[i],
-                        (L3Order){acc_opt.global_order_id++, q, 0, 0, 1});
-                }
+                int qb = (t * 13 + i * 7) % 40 + 10;
+                ob_add_order_baseline(&ob_base.bids[i],
+                    (L3Order){acc_base.global_order_id++, qb, 0, 0, 1});
+                ob_add_order_opt(&ob_opt.bids[i],
+                    (L3Order){acc_opt.global_order_id++, qb, 0, 0, 1});
+
+                int qa = (t * 17 + i * 11) % 40 + 10;
+                ob_add_order_baseline(&ob_base.asks[i],
+                    (L3Order){acc_base.global_order_id++, qa, 0, 0, 1});
+                ob_add_order_opt(&ob_opt.asks[i],
+                    (L3Order){acc_opt.global_order_id++, qa, 0, 0, 1});
             }
         }
 
@@ -127,4 +127,87 @@ int main(void) {
         printf("FAIL: %d mismatches found\n", mismatches);
         return 1;
     }
+}
+
+// ============================================================================
+// Test 2: queue-capacity regression test.
+//
+// Guards against the bug that ob_add_order_opt originally had: writing into
+// lvl->queue[lvl->order_count++] with no check against MAX_ORDERS_PER_LVL.
+// A level that is already full and receives one more insert used to write
+// past the end of the fixed-size queue[] array — undefined behavior, and
+// with the wrong luck, silent corruption of whatever memory follows it,
+// not necessarily a crash. This fills a level to exact capacity, then
+// attempts one more insert and asserts:
+//   - the insert is rejected (return value 0)
+//   - order_count and total_qty are unchanged (no partial/corrupt write)
+//   - every already-resident order is untouched (memcmp against a saved
+//     copy), which is what an out-of-bounds write into adjacent struct
+//     fields would otherwise disturb
+// Run this binary under -fsanitize=address,undefined (`make asan`) for an
+// independent check that no out-of-bounds write happens even if the
+// in-process assertions above didn't catch it.
+// ============================================================================
+static int test_capacity_bounds_one(const char *label,
+                                     int (*add)(L3PriceLevel *, L3Order)) {
+    L3PriceLevel lvl;
+    memset(&lvl, 0, sizeof(lvl));
+    lvl.price = 100;
+
+    for (int i = 0; i < MAX_ORDERS_PER_LVL; i++) {
+        L3Order o = {1000 + i, 10 + i, 0, 0, 0};
+        if (!add(&lvl, o)) {
+            printf("FAIL [%s]: insert %d/%d unexpectedly rejected while "
+                   "level had room\n", label, i, MAX_ORDERS_PER_LVL);
+            return 1;
+        }
+    }
+    if (lvl.order_count != MAX_ORDERS_PER_LVL) {
+        printf("FAIL [%s]: order_count=%d after filling to capacity, "
+               "expected %d\n", label, lvl.order_count, MAX_ORDERS_PER_LVL);
+        return 1;
+    }
+
+    L3PriceLevel before = lvl;
+
+    // The level is now exactly full. One more insert must be rejected, not
+    // silently overrun the array.
+    L3Order overflow = {9999, 999, 0, 0, 0};
+    int accepted = add(&lvl, overflow);
+
+    if (accepted) {
+        printf("FAIL [%s]: insert into a full level (order_count=%d, "
+               "capacity=%d) was accepted instead of rejected\n",
+               label, MAX_ORDERS_PER_LVL, MAX_ORDERS_PER_LVL);
+        return 1;
+    }
+    if (memcmp(&lvl, &before, sizeof(lvl)) != 0) {
+        printf("FAIL [%s]: level state changed after a rejected insert "
+               "(order_count, total_qty, or queue contents mutated)\n", label);
+        return 1;
+    }
+
+    printf("PASS [%s]: filled to capacity (%d orders), 11th insert "
+           "correctly rejected, no state mutated\n", label, MAX_ORDERS_PER_LVL);
+    return 0;
+}
+
+static int test_capacity_bounds(void) {
+    int failures = 0;
+    failures += test_capacity_bounds_one("ob_add_order_baseline", ob_add_order_baseline);
+    failures += test_capacity_bounds_one("ob_add_order_opt",      ob_add_order_opt);
+    return failures;
+}
+
+int main(void) {
+    int failures = 0;
+    failures += test_tick_replay();
+    failures += test_capacity_bounds();
+
+    if (failures == 0) {
+        printf("\nALL TESTS PASSED\n");
+        return 0;
+    }
+    printf("\n%d TEST GROUP(S) FAILED\n", failures);
+    return 1;
 }

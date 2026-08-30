@@ -258,9 +258,40 @@ void ob_market_sell_opt(L3OrderBook *ob, EngineAccount *acc, int qty, int is_pla
     }
 }
 
-void ob_add_order_opt(L3PriceLevel *lvl, L3Order order) {
+// ----------------------------------------------------------------------
+// BUG FOUND DURING HARDENING (fixed here, not present in main.c):
+//
+// main.c never inserts into lvl->queue without first checking
+// `order_count < MAX_ORDERS_PER_LVL` at the call site (see process_tick).
+// When the matching logic was extracted into this standalone function,
+// that check was dropped — ob_add_order_opt used to write unconditionally
+// to lvl->queue[lvl->order_count++]. Since queue[] is a fixed-size array
+// (L3Order queue[MAX_ORDERS_PER_LVL]) embedded directly in L3PriceLevel,
+// a level that was already at capacity and received one more insert would
+// write past the end of queue[] into whatever struct field follows it —
+// silent memory corruption, not a crash, and exactly the kind of bug a
+// correctness harness can miss if its synthetic workload never happens to
+// fill a level to capacity.
+//
+// The fix: don't rely on every caller to remember an external bounds
+// check (main.c did, but it's an easy invariant to lose the moment this
+// function is called from a second place). Make the function itself
+// refuse an insert into a full level and report that via return value.
+// See tests/test_correctness.c for the regression test that fills a
+// level to MAX_ORDERS_PER_LVL and asserts the next insert is rejected
+// under -fsanitize=address,undefined.
+// ----------------------------------------------------------------------
+int ob_add_order_opt(L3PriceLevel *lvl, L3Order order) {
+    if (lvl->order_count >= MAX_ORDERS_PER_LVL) return 0;
     lvl->queue[lvl->order_count++] = order;
     lvl->total_qty += order.qty; // incremental: keep total_qty in sync at insertion time
+    return 1;
+}
+
+int ob_add_order_baseline(L3PriceLevel *lvl, L3Order order) {
+    if (lvl->order_count >= MAX_ORDERS_PER_LVL) return 0;
+    lvl->queue[lvl->order_count++] = order;
+    return 1;
 }
 
 void ob_init_opt(L3OrderBook *ob, EngineAccount *acc, int base_price) {

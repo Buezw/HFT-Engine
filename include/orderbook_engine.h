@@ -72,6 +72,19 @@ void  ob_market_sell_opt(L3OrderBook *ob, EngineAccount *acc, int qty, int is_pl
 // must update it incrementally here — otherwise total_qty silently drifts
 // out of sync with the true sum, since ob_update_total_qty_opt is no longer
 // called every tick to paper over it.
-void  ob_add_order_opt(L3PriceLevel *lvl, L3Order order);
+//
+// Bounds-checked: lvl->queue has fixed capacity MAX_ORDERS_PER_LVL. Returns
+// 1 if the order was inserted, 0 if the level was already full (order
+// dropped, no state changed). The caller must not assume insertion always
+// succeeds. See README for why this check lives here rather than at each
+// call site.
+int   ob_add_order_opt(L3PriceLevel *lvl, L3Order order);
+
+// Baseline counterpart of ob_add_order_opt, with the same bounds-checked
+// contract (returns 1/0), so both implementations can be driven through an
+// identical function-pointer-compatible API in tests/benchmarks. Baseline
+// deliberately does NOT touch total_qty here — it stays correct only after
+// the next ob_update_total_qty_baseline() full rescan, matching main.c.
+int   ob_add_order_baseline(L3PriceLevel *lvl, L3Order order);
 
 #endif // ORDERBOOK_ENGINE_H
