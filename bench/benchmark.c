@@ -173,20 +173,24 @@ int main(void) {
            opt_total, (double)opt_total / TICKS);
     printf("  speedup  : %.2fx (mean)\n\n", (double)base_total / (double)opt_total);
 
+    long long base_p50 = percentile(base_tick_ns, TICKS, 0.50);
+    long long base_p90 = percentile(base_tick_ns, TICKS, 0.90);
+    long long base_p99 = percentile(base_tick_ns, TICKS, 0.99);
+    long long base_p999 = percentile(base_tick_ns, TICKS, 0.999);
+    long long opt_p50  = percentile(opt_tick_ns, TICKS, 0.50);
+    long long opt_p90  = percentile(opt_tick_ns, TICKS, 0.90);
+    long long opt_p99  = percentile(opt_tick_ns, TICKS, 0.99);
+    long long opt_p999 = percentile(opt_tick_ns, TICKS, 0.999);
+
     printf("[Per-tick latency distribution, ns — mean hides tail behavior,\n");
     printf(" so this is the number that actually matters for a hard per-tick budget]\n");
     printf("  %-12s %8s %8s %8s %8s %8s\n", "", "p50", "p90", "p99", "p99.9", "max");
     printf("  %-12s %8lld %8lld %8lld %8lld %8lld\n", "baseline",
-           percentile(base_tick_ns, TICKS, 0.50), percentile(base_tick_ns, TICKS, 0.90),
-           percentile(base_tick_ns, TICKS, 0.99), percentile(base_tick_ns, TICKS, 0.999),
-           base_tick_ns[TICKS - 1]);
+           base_p50, base_p90, base_p99, base_p999, base_tick_ns[TICKS - 1]);
     printf("  %-12s %8lld %8lld %8lld %8lld %8lld\n", "optimized",
-           percentile(opt_tick_ns, TICKS, 0.50), percentile(opt_tick_ns, TICKS, 0.90),
-           percentile(opt_tick_ns, TICKS, 0.99), percentile(opt_tick_ns, TICKS, 0.999),
-           opt_tick_ns[TICKS - 1]);
+           opt_p50, opt_p90, opt_p99, opt_p999, opt_tick_ns[TICKS - 1]);
     printf("  speedup at p50: %.2fx, at p99: %.2fx\n",
-           (double)percentile(base_tick_ns, TICKS, 0.50) / (double)percentile(opt_tick_ns, TICKS, 0.50),
-           (double)percentile(base_tick_ns, TICKS, 0.99) / (double)percentile(opt_tick_ns, TICKS, 0.99));
+           (double)base_p50 / (double)opt_p50, (double)base_p99 / (double)opt_p99);
     printf("  (max is a single-sample outlier — OS scheduling noise on a\n");
     printf("   non-realtime dev machine, not signal; p99/p99.9 are the\n");
     printf("   numbers worth trusting from this environment)\n\n");
@@ -217,18 +221,31 @@ int main(void) {
             while (ob_add_order_baseline(&ob.bids[i], (L3Order){acc.global_order_id++, 25, 0, 0, 1})) {}
             while (ob_add_order_baseline(&ob.asks[i], (L3Order){acc.global_order_id++, 25, 0, 0, 1})) {}
         }
-        const int CALLS = 5000000;
+        const int CALLS = 2000000;
         long long t0 = now_ns();
         for (int i = 0; i < CALLS; i++) ob_update_total_qty_baseline(&ob);
         long long dt = now_ns() - t0;
+        double rescan_ns_per_call = (double)dt / CALLS;
         printf("[Isolated cost of the full-rescan ob_update_total_qty_baseline,\n");
         printf(" book at max depth (%d levels x %d orders each)]\n",
                MAX_PRICE_LEVELS, MAX_ORDERS_PER_LVL);
-        printf("  %lld ns / %d calls -> %.1f ns/call\n", dt, CALLS, (double)dt / CALLS);
+        printf("  %lld ns / %d calls -> %.1f ns/call\n", dt, CALLS, rescan_ns_per_call);
         printf("  In the optimized engine this call is REMOVED from the hot\n");
         printf("  per-tick path entirely (0 ns/tick), since total_qty is kept\n");
         printf("  in sync incrementally by ob_market_*_opt / ob_add_order_opt.\n");
-        printf("  This is the dominant contribution to the full-tick speedup above.\n");
+        printf("  This is the dominant contribution to the full-tick speedup above.\n\n");
+
+        // Single machine-parseable line consumed by `make depth-sweep` (see
+        // Makefile / README): lets that target compile this file at several
+        // MAX_ORDERS_PER_LVL values and tabulate how the gap grows with
+        // depth, instead of just asserting that it does.
+        printf("SWEEP_ROW depth=%d mean_ns_base=%.1f mean_ns_opt=%.1f "
+               "p50_ns_base=%lld p50_ns_opt=%lld p99_ns_base=%lld p99_ns_opt=%lld "
+               "rescan_ns_per_call_base=%.1f\n",
+               MAX_ORDERS_PER_LVL,
+               (double)base_total / TICKS, (double)opt_total / TICKS,
+               base_p50, opt_p50, base_p99, opt_p99,
+               rescan_ns_per_call);
     }
 
     return 0;
