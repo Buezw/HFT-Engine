@@ -26,8 +26,11 @@ include/orderbook_engine.h   public API + data structures for the extracted engi
 src/orderbook_engine.c       baseline + optimized implementations, limit order lifecycle, risk limit
 tests/test_correctness.c     200k-tick replay + capacity/lifecycle/stress/risk-limit tests
 bench/benchmark.c            baseline-vs-optimized timing: mean, percentiles, depth sweep
+tools/book_trace.c           runs a scenario against the opt engine, dumps per-tick JSON
+tools/render_trace.py        wraps the JSON trace into a self-contained HTML replay
+tools/visualizer_template.html  the replay page itself (ladder + inventory/PnL/depth charts)
 scripts/format_depth_sweep.awk  tabulates `make depth-sweep` output
-Makefile                     test / bench / asan / cppcheck / depth-sweep / clean targets
+Makefile                     test / bench / asan / cppcheck / depth-sweep / visualize / clean targets
 .github/workflows/ci.yml     runs test / bench / asan / cppcheck on every push/PR
 ```
 
@@ -372,6 +375,41 @@ small scale, a benchmark that only ran at the shipped configuration
 wouldn't have shown *why* it's modest, and now there's a table instead of
 an assertion.
 
+## Trace visualizer
+
+The only rendering this project ever had was `board/main.c`'s VGA
+framebuffer — DE1-SoC only, not viewable without the physical board. The
+desktop-testable engine had nothing: `printf("PASS")` and raw nanosecond
+numbers, no way to actually see book state, fills, or account state change
+over time. `make visualize` fixes that:
+
+- `tools/book_trace.c` runs a fixed, reproducible 300-tick scenario (market
+  noise liquidity + noise market orders, player limit placements/cancels via
+  the indexed lifecycle, player risk-checked market orders — the same
+  public API used everywhere else in this project, not a second
+  implementation of anything) against `*_opt`, and prints one JSON object
+  per tick to stdout: every price level, every order (id, qty, `is_mine`,
+  ghost state), and account state.
+- `tools/render_trace.py` embeds that JSON into `tools/visualizer_template.html`,
+  producing `build/book_visualizer.html` — self-contained, no server, just
+  open it in a browser. Scrub or play through the 300 ticks; the ladder
+  highlights `is_mine` orders (yellow) and ghost/pending-cleanup orders
+  (dimmed), and side panel charts track inventory, PnL, and bid/ask depth
+  over time.
+
+**A finding this made obvious that wasn't obvious from code alone:** price
+levels are set once in `ob_init_*` and never move again — nothing in this
+engine reprices a level. Watching the replay, only *quantities* move; the
+ladder's price column is frozen for the entire 300 ticks. That's invisible
+reading `ob_market_buy_opt` in isolation (it only ever fills against
+whatever `lvl->price` already is), but it matters a lot for building a
+market maker on top of this engine: there's no fair-value drift, no
+adverse selection, nothing to hedge against, and no notion of "the market
+moved against you" — the primary risk a real market maker manages. Any
+quoting/inventory-skew logic added next either needs its own price-walk
+mechanism, or needs to be honest that it's optimizing spread capture against
+a market that structurally cannot move.
+
 ## How to run it yourself
 
 ```bash
@@ -380,6 +418,7 @@ make bench        # runs `make test` first, then builds + runs the benchmark
 make asan         # rebuild the tests with clang -fsanitize=address,undefined and run them
 make cppcheck     # static analysis over src/, bench/, tests/
 make depth-sweep  # ~35s: the table in the Results section above, regenerated live
+make visualize    # builds build/book_visualizer.html — open it in a browser
 make clean        # remove build/
 ```
 

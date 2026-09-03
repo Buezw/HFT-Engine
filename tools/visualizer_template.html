@@ -1,0 +1,271 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Order Book Trace Viewer</title>
+<style>
+  :root {
+    --bg: #0b0e11; --panel: #12161b; --border: #232a32;
+    --text: #e6e9ec; --muted: #7a8794;
+    --bid: #1fa855; --bid-dim: #16341f;
+    --ask: #d64545; --ask-dim: #3a1c1c;
+    --mine: #e0b341; --accent: #4aa3ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    padding: 16px;
+  }
+  h1 { font-size: 15px; margin: 0 0 12px; color: var(--text); font-weight: 600; }
+  .layout { display: grid; grid-template-columns: 1fr 340px; gap: 16px; align-items: start; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
+  .transport { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  button {
+    background: #1b2129; color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit;
+  }
+  button:hover { border-color: var(--accent); }
+  input[type=range] { flex: 1; min-width: 200px; accent-color: var(--accent); }
+  .tickno { color: var(--accent); font-weight: 600; min-width: 90px; }
+  .event { color: var(--muted); margin-bottom: 12px; min-height: 1.2em; }
+  .ladder { display: flex; flex-direction: column; gap: 1px; }
+  .row { display: grid; grid-template-columns: 70px 1fr 50px; gap: 8px; align-items: center; padding: 3px 4px; border-radius: 4px; }
+  .row.ask { }
+  .row.bid { }
+  .price { text-align: right; color: var(--muted); }
+  .row.ask .price { color: var(--ask); }
+  .row.bid .price { color: var(--bid); }
+  .bar-wrap { position: relative; height: 18px; background: #0d1114; border-radius: 3px; overflow: hidden; }
+  .bar { position: absolute; top: 0; bottom: 0; }
+  .row.ask .bar { right: 0; background: var(--ask-dim); }
+  .row.bid .bar { left: 0; background: var(--bid-dim); }
+  .orders { position: relative; z-index: 1; display: flex; gap: 3px; padding: 0 4px; height: 18px; align-items: center; flex-wrap: nowrap; overflow: hidden; }
+  .chip {
+    font-size: 10px; padding: 1px 4px; border-radius: 3px; background: #232a32; color: var(--muted);
+    white-space: nowrap;
+  }
+  .chip.mine { background: var(--mine); color: #1a1400; font-weight: 700; }
+  .chip.ghost { opacity: 0.35; text-decoration: line-through; }
+  .qty { text-align: right; color: var(--muted); }
+  .spread-row { text-align: center; color: var(--muted); padding: 6px 0; border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border); margin: 4px 0; font-size: 11px; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; }
+  .card { background: #0d1114; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; }
+  .card .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .card .value { font-size: 16px; font-weight: 700; margin-top: 2px; }
+  .value.pos { color: var(--bid); }
+  .value.neg { color: var(--ask); }
+  .chart-label { color: var(--muted); font-size: 11px; margin: 10px 0 4px; }
+  svg.chart { width: 100%; height: 60px; display: block; }
+  .legend { display: flex; gap: 10px; font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .legend span::before { content: "\25A0"; margin-right: 4px; }
+  .legend .bid-l::before { color: var(--bid); }
+  .legend .ask-l::before { color: var(--ask); }
+  kbd { background: #232a32; border-radius: 3px; padding: 1px 5px; font-size: 10px; }
+  .hint { color: var(--muted); font-size: 11px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<h1>Order Book Trace Viewer</h1>
+<div class="layout">
+  <div class="panel">
+    <div class="transport">
+      <button id="stepBack">&larr;</button>
+      <button id="playBtn">&#9654; Play</button>
+      <button id="stepFwd">&rarr;</button>
+      <input type="range" id="scrubber" min="0" value="0" step="1">
+      <span class="tickno" id="tickLabel">tick 0</span>
+    </div>
+    <div class="event" id="eventLabel"></div>
+    <div class="ladder" id="ladder"></div>
+    <div class="hint"><kbd>&larr;</kbd>/<kbd>&rarr;</kbd> step &middot; <kbd>space</kbd> play/pause &middot; yellow chip = player's own resting order (is_mine)</div>
+  </div>
+  <div class="panel">
+    <div class="cards">
+      <div class="card"><div class="label">Cash</div><div class="value" id="cashVal">-</div></div>
+      <div class="card"><div class="label">Inventory</div><div class="value" id="invVal">-</div></div>
+      <div class="card"><div class="label">PnL (mark @ best bid)</div><div class="value" id="pnlVal">-</div></div>
+      <div class="card"><div class="label">Fill volume</div><div class="value" id="fillVal">-</div></div>
+    </div>
+    <div class="chart-label">Inventory over time</div>
+    <svg class="chart" id="chartInv"></svg>
+    <div class="chart-label">PnL over time</div>
+    <svg class="chart" id="chartPnl"></svg>
+    <div class="chart-label">Book depth over time (total resting qty)</div>
+    <svg class="chart" id="chartDepth"></svg>
+    <div class="legend"><span class="bid-l">bid depth</span><span class="ask-l">ask depth</span></div>
+  </div>
+</div>
+
+<script>
+const TRACE = __TRACE_JSON__;
+
+const $ = (id) => document.getElementById(id);
+const scrubber = $('scrubber');
+scrubber.max = TRACE.length - 1;
+
+let playing = false;
+let playTimer = null;
+
+function levelTotalQty(levels) {
+  return levels.reduce((s, l) => s + l.total_qty, 0);
+}
+
+function buildSeries(field) {
+  return TRACE.map(t => field(t));
+}
+const invSeries = buildSeries(t => t.account.inventory);
+const pnlSeries = buildSeries(t => t.account.pnl);
+const bidDepthSeries = buildSeries(t => levelTotalQty(t.bids));
+const askDepthSeries = buildSeries(t => levelTotalQty(t.asks));
+const maxLevelQty = Math.max(1, ...TRACE.flatMap(t => t.bids.concat(t.asks).map(l => l.total_qty)));
+
+function drawLineChart(svg, series, color) {
+  const w = 300, h = 60, pad = 4;
+  const min = Math.min(...series), max = Math.max(...series);
+  const range = (max - min) || 1;
+  const pts = series.map((v, i) => {
+    const x = pad + (i / (series.length - 1 || 1)) * (w - 2 * pad);
+    const y = h - pad - ((v - min) / range) * (h - 2 * pad);
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  svg.innerHTML = `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" />`;
+  return { w, h, pad, min, max, range };
+}
+
+function drawDualChart(svg, seriesA, colorA, seriesB, colorB) {
+  const w = 300, h = 60, pad = 4;
+  const all = seriesA.concat(seriesB);
+  const min = Math.min(...all), max = Math.max(...all);
+  const range = (max - min) || 1;
+  const toPts = (series) => series.map((v, i) => {
+    const x = pad + (i / (series.length - 1 || 1)) * (w - 2 * pad);
+    const y = h - pad - ((v - min) / range) * (h - 2 * pad);
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  svg.innerHTML =
+    `<polyline points="${toPts(seriesA)}" fill="none" stroke="${colorA}" stroke-width="1.5" />` +
+    `<polyline points="${toPts(seriesB)}" fill="none" stroke="${colorB}" stroke-width="1.5" />`;
+  return { w, h, pad };
+}
+
+let invMeta, pnlMeta, depthMeta;
+function renderCharts() {
+  invMeta = drawLineChart($('chartInv'), invSeries, '#4aa3ff');
+  pnlMeta = drawLineChart($('chartPnl'), pnlSeries, '#e0b341');
+  depthMeta = drawDualChart($('chartDepth'), bidDepthSeries, '#1fa855', askDepthSeries, '#d64545');
+}
+
+function markerFor(svg, meta, i) {
+  const old = svg.querySelector('.marker');
+  if (old) old.remove();
+  const x = meta.pad + (i / (TRACE.length - 1 || 1)) * (meta.w - 2 * meta.pad);
+  const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+  line.setAttribute('class', 'marker');
+  line.setAttribute('x1', x); line.setAttribute('x2', x);
+  line.setAttribute('y1', 0); line.setAttribute('y2', meta.h);
+  line.setAttribute('stroke', '#7a8794');
+  line.setAttribute('stroke-width', '1');
+  line.setAttribute('stroke-dasharray', '2,2');
+  svg.appendChild(line);
+}
+
+function renderLadder(t) {
+  const ladder = $('ladder');
+  ladder.innerHTML = '';
+
+  const asksDesc = t.asks.slice().sort((a, b) => b.price - a.price);
+  const bidsDesc = t.bids.slice().sort((a, b) => b.price - a.price);
+
+  function orderChip(o) {
+    const cls = ['chip'];
+    if (o.is_mine) cls.push('mine');
+    if (o.state === 2) cls.push('ghost');
+    const span = document.createElement('span');
+    span.className = cls.join(' ');
+    span.textContent = o.qty;
+    span.title = `order #${o.id}${o.is_mine ? ' (mine)' : ''}${o.state === 2 ? ' [ghost]' : ''}`;
+    return span;
+  }
+
+  function levelRow(level, side) {
+    const row = document.createElement('div');
+    row.className = 'row ' + side;
+    const price = document.createElement('div');
+    price.className = 'price';
+    price.textContent = level.price;
+    const barWrap = document.createElement('div');
+    barWrap.className = 'bar-wrap';
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    const pct = Math.min(100, (level.total_qty / maxLevelQty) * 100);
+    bar.style.width = pct + '%';
+    const orders = document.createElement('div');
+    orders.className = 'orders';
+    level.orders.forEach(o => orders.appendChild(orderChip(o)));
+    barWrap.appendChild(bar);
+    barWrap.appendChild(orders);
+    const qty = document.createElement('div');
+    qty.className = 'qty';
+    qty.textContent = level.total_qty;
+    row.appendChild(price); row.appendChild(barWrap); row.appendChild(qty);
+    return row;
+  }
+
+  asksDesc.forEach(l => ladder.appendChild(levelRow(l, 'ask')));
+  const spread = document.createElement('div');
+  spread.className = 'spread-row';
+  const bestBid = Math.max(...t.bids.map(l => l.price));
+  const bestAsk = Math.min(...t.asks.map(l => l.price));
+  spread.textContent = `spread ${bestAsk - bestBid}  ·  mid ${((bestAsk + bestBid) / 2).toFixed(1)}`;
+  ladder.appendChild(spread);
+  bidsDesc.forEach(l => ladder.appendChild(levelRow(l, 'bid')));
+}
+
+function render(i) {
+  const t = TRACE[i];
+  $('tickLabel').textContent = `tick ${t.tick} / ${TRACE[TRACE.length - 1].tick}`;
+  $('eventLabel').textContent = t.event;
+  $('cashVal').textContent = t.account.cash.toLocaleString();
+  $('invVal').textContent = t.account.inventory.toLocaleString();
+  const pnlEl = $('pnlVal');
+  pnlEl.textContent = t.account.pnl.toLocaleString();
+  pnlEl.className = 'value ' + (t.account.pnl >= 0 ? 'pos' : 'neg');
+  $('fillVal').textContent = t.account.fill_volume.toLocaleString();
+  renderLadder(t);
+  markerFor($('chartInv'), invMeta, i);
+  markerFor($('chartPnl'), pnlMeta, i);
+  markerFor($('chartDepth'), depthMeta, i);
+  scrubber.value = i;
+}
+
+function setPlaying(p) {
+  playing = p;
+  $('playBtn').innerHTML = playing ? '&#9208; Pause' : '&#9654; Play';
+  if (playTimer) { clearInterval(playTimer); playTimer = null; }
+  if (playing) {
+    playTimer = setInterval(() => {
+      let i = parseInt(scrubber.value, 10) + 1;
+      if (i >= TRACE.length) { setPlaying(false); return; }
+      render(i);
+    }, 120);
+  }
+}
+
+scrubber.addEventListener('input', () => render(parseInt(scrubber.value, 10)));
+$('stepFwd').addEventListener('click', () => render(Math.min(TRACE.length - 1, parseInt(scrubber.value, 10) + 1)));
+$('stepBack').addEventListener('click', () => render(Math.max(0, parseInt(scrubber.value, 10) - 1)));
+$('playBtn').addEventListener('click', () => setPlaying(!playing));
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); setPlaying(!playing); }
+  if (e.code === 'ArrowRight') render(Math.min(TRACE.length - 1, parseInt(scrubber.value, 10) + 1));
+  if (e.code === 'ArrowLeft') render(Math.max(0, parseInt(scrubber.value, 10) - 1));
+});
+
+renderCharts();
+render(0);
+</script>
+</body>
+</html>

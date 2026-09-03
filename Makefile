@@ -3,15 +3,16 @@ CFLAGS   ?= -O2 -Wall -Wextra -Wpedantic -std=c11 -Iinclude
 SAN_CC   ?= clang
 SAN_FLAGS = -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wall -Wextra -Iinclude
 
-SRC       = src/orderbook_engine.c
-TEST_SRC  = tests/test_correctness.c
-BENCH_SRC = bench/benchmark.c
+SRC        = src/orderbook_engine.c
+TEST_SRC   = tests/test_correctness.c
+BENCH_SRC  = bench/benchmark.c
+TRACE_SRC  = tools/book_trace.c
 
 BUILD_DIR = build
 
 DEPTHS = 10 25 50 100 200 400
 
-.PHONY: all test bench asan clean cppcheck depth-sweep
+.PHONY: all test bench asan clean cppcheck depth-sweep visualize
 
 all: $(BUILD_DIR)/test_correctness $(BUILD_DIR)/benchmark
 
@@ -55,6 +56,18 @@ depth-sweep: | $(BUILD_DIR)
 	done
 	@echo
 	@awk -f scripts/format_depth_sweep.awk $(BUILD_DIR)/depth_sweep_rows.txt
+
+# Runs a fixed 300-tick scenario against the opt engine (market noise +
+# player limit orders/cancels/risk-checked orders), dumps one JSON object
+# per tick, then wraps it into a self-contained, scrubbable HTML replay.
+# No server needed — open the printed path directly in a browser.
+visualize: $(BUILD_DIR)/book_trace | $(BUILD_DIR)
+	./$(BUILD_DIR)/book_trace 300 > $(BUILD_DIR)/book_trace.jsonl
+	python3 tools/render_trace.py $(BUILD_DIR)/book_trace.jsonl \
+		tools/visualizer_template.html $(BUILD_DIR)/book_visualizer.html
+
+$(BUILD_DIR)/book_trace: $(TRACE_SRC) $(SRC) include/orderbook_engine.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $(TRACE_SRC) $(SRC)
 
 cppcheck:
 	cppcheck --enable=warning,style,performance,portability \
