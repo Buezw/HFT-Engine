@@ -39,7 +39,16 @@ typedef struct {
     int qty;
     int ghost_qty;
     int is_mine;
-    int visual_fx; // 0=Normal, 1=Flash, 2=Ghost/pending cleanup
+    // Inherited its name from main.c's L3Order.visual_fx (there: 0=Normal,
+    // 1=Flash white on fill, 2=Ghost/pending cleanup — a UI render-state
+    // field). Only the Ghost value ever gets set or checked in this
+    // extracted engine (main.c's rendering code, which is the only place
+    // that ever used Flash, isn't part of this build) — so here it's
+    // purely matching-engine state, not a UI flag: 2 means "filled or
+    // cancelled, still occupying a queue slot until the next compaction
+    // pass removes it." Renamed to `state` to match what it actually does
+    // in this codebase, not what it was called in the one it came from.
+    int state; // 0=live, 2=ghost (filled/cancelled, pending ob_clean_ghosts_* compaction)
 } L3Order;
 
 typedef struct {
@@ -174,5 +183,88 @@ int ob_market_buy_risk_checked_baseline (L3OrderBook *ob, EngineAccount *acc, in
 int ob_market_buy_risk_checked_opt      (L3OrderBook *ob, EngineAccount *acc, int qty);
 int ob_market_sell_risk_checked_baseline(L3OrderBook *ob, EngineAccount *acc, int qty);
 int ob_market_sell_risk_checked_opt     (L3OrderBook *ob, EngineAccount *acc, int qty);
+
+// ----------------------------------------------------------------------
+// O(1) cancel-by-id index (opt only, x86 side — not part of the memcmp'd
+// L3OrderBook/L3PriceLevel/L3Order layout the baseline<->opt correctness
+// harness in tests/test_correctness.c relies on).
+//
+// ob_cancel_order_opt (above) is a deliberate O(orders-in-book) linear
+// scan across the whole book, justified there by the book being capped at
+// ~60 orders at the board's real depth. That justification stops holding
+// once MAX_ORDERS_PER_LVL is scaled up (see `make depth-sweep`, which
+// drives it to 400) — at that depth a cancel walks up to 2400 order
+// slots. This section adds an O(1)-lookup path for that case, without
+// touching ob_cancel_order_opt or the shared L3OrderBook/L3PriceLevel/
+// L3Order types at all, because of two hard constraints already baked
+// into this codebase:
+//
+//   1. tests/test_correctness.c proves baseline == opt with a raw
+//      memcmp(a, b, sizeof(L3OrderBook)). Any extra per-order bookkeeping
+//      (a self-index, a generation counter, ...) added to L3Order or
+//      L3PriceLevel would make that memcmp fail immediately, since
+//      baseline has no equivalent field to keep in sync. So the index
+//      lives in its own struct, populated/maintained by new wrapper
+//      functions, not inside the order/level structs themselves.
+//
+//   2. bench/benchmark.c drives ob_clean_ghosts_opt through a generic
+//      `void (*)(L3PriceLevel *)` function pointer, identically to
+//      baseline's clean_ghosts, so the two stay directly comparable.
+//      Giving ob_clean_ghosts_opt an extra parameter to keep an index in
+//      sync during compaction would break that shared calling contract.
+//      So ob_clean_ghosts_opt is left untouched, which means a compaction
+//      can still silently move an indexed order to a new slot within its
+//      level without the index knowing.
+//
+// The design that fits both constraints: the index caches (level, slot)
+// per order id. A lookup checks the cached slot first — O(1), and correct
+// whenever no compaction has touched that level since the order was
+// placed or last found, which is the common case. If the cached slot
+// doesn't match (a compaction moved it), the fallback rescans only that
+// ONE level (bounded by MAX_ORDERS_PER_LVL), never the rest of the book.
+// So this is O(1) amortized with an O(single-level-depth) worst case,
+// strictly better than baseline's unconditional O(whole-book-depth) in
+// every case, and exactly O(1) in the common one.
+//
+// Open addressing, linear probing, fixed-size static array — no malloc,
+// same memory model as everything else here. Capacity is a flat 8192:
+// the maximum possible concurrently-live is_mine orders across every
+// depth `make depth-sweep` tests (DEPTHS up to 400 in the Makefile) is
+// 2 sides * MAX_PRICE_LEVELS(3) * 400 = 2400, so 8192 keeps the load
+// factor under ~30% even at the largest swept depth.
+// ----------------------------------------------------------------------
+#define ORDER_INDEX_CAPACITY 8192
+
+typedef struct {
+    int32_t        order_id; // -1 = empty slot, -2 = tombstone (cancelled/removed)
+    L3PriceLevel  *lvl;
+    uint16_t       slot;
+    uint8_t        is_bid;
+} OrderIndexEntry;
+
+typedef struct {
+    OrderIndexEntry buckets[ORDER_INDEX_CAPACITY];
+} OrderIndex;
+
+// Must be called once before first use (equivalent of ob_init_* for the
+// index itself). Marks every bucket empty.
+void ob_index_init(OrderIndex *idx);
+
+// Same contract as ob_place_limit_buy_opt/ob_place_limit_sell_opt (see
+// above), but also registers the new order in `idx` so it can later be
+// found in O(1) by ob_cancel_order_opt_indexed. Internally calls the
+// existing, already-tested ob_place_limit_buy_opt/sell_opt — this does
+// not duplicate or reimplement the placement logic, only adds indexing
+// on top of it.
+int ob_place_limit_buy_opt_indexed (L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int level, int qty);
+int ob_place_limit_sell_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int level, int qty);
+
+// O(1) amortized counterpart to ob_cancel_order_opt: hashes order_id to
+// its cached (level, slot) instead of scanning the whole book. Falls back
+// to scanning only the one level the index points at if the cached slot
+// went stale (see file comment above for exactly when/why that happens).
+// Same return contract as ob_cancel_order_opt: 1 if found and cancelled,
+// 0 if not (already gone, or never existed).
+int ob_cancel_order_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int order_id);
 
 #endif // ORDERBOOK_ENGINE_H

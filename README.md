@@ -43,10 +43,12 @@ Makefile                     test / bench / asan / cppcheck / depth-sweep / clea
   - `*_opt` — an optimized version with the same external behavior
   - plus a resting player limit-order lifecycle (`ob_place_limit_*`,
     `ob_cancel_order_*`) that completes a feature `main.c` only half-built
-    (see below), and a pre-trade position risk limit
-    (`ob_market_*_risk_checked_*`) — both new in the extracted engine, not
+    (see below), a pre-trade position risk limit
+    (`ob_market_*_risk_checked_*`), and an O(1) cancel-by-id index
+    (`OrderIndex`, `ob_place_limit_*_opt_indexed`,
+    `ob_cancel_order_opt_indexed`) — all new in the extracted engine, not
     ports of anything in `main.c`.
-- `tests/test_correctness.c` — six things, in order: (1) replays 200,000
+- `tests/test_correctness.c` — seven things, in order: (1) replays 200,000
   ticks of synthetic market-maker + player activity against both engines
   and asserts identical account state and book state after every tick —
   this has to pass before any benchmark number means anything; (2) a
@@ -58,12 +60,16 @@ Makefile                     test / bench / asan / cppcheck / depth-sweep / clea
   placements, and cancels, diffing full state after every operation; (5)
   risk-limit clipping arithmetic in isolation; (6) a 20,000-iteration
   randomized run asserting the position limit invariant holds through
-  real matching on both engines.
+  real matching on both engines; (7) the O(1) index's fast path, its
+  bounded fallback when a compaction stales the cache, and a 50,000-
+  iteration randomized run proving it's behaviorally identical to the
+  plain linear-scan cancel at every step.
 - `bench/benchmark.c` — measures baseline vs optimized under identical
   workload using `clock_gettime(CLOCK_MONOTONIC)`, reporting the mean,
-  the p50/p90/p99/p99.9 latency distribution per tick, and (via
+  the p50/p90/p99/p99.9 latency distribution per tick, (via
   `make depth-sweep`) how the gap between baseline and optimized scales
-  as book depth grows past the board's real value.
+  as book depth grows past the board's real value, and a dedicated
+  linear-scan-vs-indexed cancel comparison at a fixed worst-case position.
 
 ## Bug fixed in `main.c`
 
@@ -148,10 +154,11 @@ and the cancel-refund logic meaningful instead of dead code:
   `O(orders)` linear scan across the whole book rather than an indexed
   lookup: book size is capped at `MAX_PRICE_LEVELS * MAX_ORDERS_PER_LVL *
   2` (60 orders at the board's real depth), so a scan is a handful of
-  cache-line reads — not worth an `order_id -> location` index without
-  evidence (profiling) that this is ever hot. Stated explicitly rather
-  than silently over-engineered: a real production engine handling
-  unbounded depth would want that index; this one doesn't need it yet.
+  cache-line reads. This reasoning holds at the board's real depth, and
+  `ob_cancel_order_*` is deliberately left exactly as-is — but it stops
+  holding once depth is scaled the way `make depth-sweep` does (see "O(1)
+  cancel-by-id index" below for the actual indexed alternative that was
+  added once that stopped being hypothetical).
 
 Tested two ways: a deterministic test walks through placement,
 reservation, invalid-input rejection, cancel, exact refund, and
@@ -222,6 +229,69 @@ interrupt) do more work than necessary:
 Both were verified to produce byte-identical account and book state to the
 original across 200,000 simulated ticks (`test_correctness.c`) before any
 performance number was trusted.
+
+## O(1) cancel-by-id index
+
+`ob_cancel_order_opt` (above) is an honest `O(orders-in-book)` scan,
+justified by a 60-order book at the board's real depth. `make depth-sweep`
+already exists to scale `MAX_ORDERS_PER_LVL` up to 400 to see how the other
+two optimizations hold up as depth grows — at that depth a cancel walks up
+to 2,400 order slots per call, and the "just scan it, it's cheap" reasoning
+stops holding. This section is the O(1) alternative for that case.
+
+Two hard constraints, already baked into this codebase, shaped the design:
+
+1. `test_correctness.c` proves baseline == opt with a raw
+   `memcmp(a, b, sizeof(L3OrderBook))`. Any extra per-order bookkeeping
+   added to `L3Order` or `L3PriceLevel` (a self-index, a generation
+   counter) would make that `memcmp` fail immediately, since baseline has
+   no equivalent field to keep in sync. So the index (`OrderIndex`) lives
+   in its own struct, populated by new wrapper functions
+   (`ob_place_limit_*_opt_indexed`, `ob_cancel_order_opt_indexed`), never
+   inside the order/level structs themselves.
+2. `bench/benchmark.c` drives `ob_clean_ghosts_opt` through a generic
+   `void (*)(L3PriceLevel *)` function pointer, identically to baseline's
+   `clean_ghosts`, so the two stay directly comparable. Giving
+   `ob_clean_ghosts_opt` an extra parameter to keep an index in sync
+   during compaction would break that shared calling contract, so it's
+   left untouched — which means a compaction can silently move an
+   indexed order to a new slot within its level without the index
+   knowing.
+
+The design that fits both constraints: the index (open addressing, linear
+probing, a flat 8,192-bucket static array — no malloc) caches `(level,
+slot)` per order id. A lookup checks the cached slot first: **O(1)**, and
+correct whenever no compaction has touched that level since the order was
+placed or last found — the common case. If the cached slot doesn't match
+(a compaction moved it), the fallback rescans only that **one level**
+(bounded by `MAX_ORDERS_PER_LVL`), never the rest of the book. So it's
+O(1) amortized with an O(single-level-depth) worst case — strictly better
+than the unconditional whole-book scan in every case, exactly O(1) in the
+common one.
+
+Tested three ways, all against `ob_cancel_order_opt` as the reference
+behavior: the fast path (place, cancel immediately, no compaction in
+between — must hit the cache directly); the fallback (place, force a
+compaction that shifts the order to a different slot, then cancel — must
+still succeed via the bounded rescan, not just return "not found"); and a
+50,000-iteration randomized run mixing market orders, indexed placements,
+and indexed cancels, diffing full account+book state against the plain
+linear-scan cancel after every single operation. All three pass under
+`make asan`.
+
+Measured, not just argued — `bench/benchmark.c` cancels an order pinned at
+the worst-case position (last slot of the last ask level, the last place
+`ob_cancel_order_opt`'s scan would ever reach) for both variants:
+
+```
+depth=10:   linear scan  47.3 ns/call   indexed  20.7 ns/call   2.29x
+depth=400:  linear scan 1138.6 ns/call  indexed  22.4 ns/call  50.92x
+```
+
+The indexed lookup's cost doesn't move with depth (~21-22 ns/call at both
+10 and 400); the linear scan's grows roughly with it (24x more depth →
+~24x more time). That's the O(1)-vs-O(n) story made concrete instead of
+just asserted.
 
 ## Results (x86_64 dev machine, see caveat below)
 
@@ -391,6 +461,21 @@ A useful narrative arc, in order:
    without — on top of it. Being able to say why you *didn't* just add an
    `if` statement inside the existing function is as much the signal as
    the risk check itself.
+
+8. **What you did once "it's cheap, don't bother indexing" stopped being
+   true**: the original cancel was an honest, stated tradeoff — O(orders)
+   is fine at a 60-order book. `make depth-sweep` already existed to test
+   whether that kind of reasoning holds up as depth scales, so rather than
+   leaving the tradeoff as a static claim, you built the O(1) index it
+   implied was eventually needed — and did it under two real constraints
+   the existing codebase had already committed to (a byte-level
+   `memcmp` correctness harness, and a function-pointer-driven benchmark
+   contract), not by rewriting either of them to make the new feature
+   easier. Talking through *why* the index caches `(level, slot)` instead
+   of a live pointer, and why the fallback is bounded to one level instead
+   of requiring the index to stay perfectly in sync with a compaction
+   routine it can't safely be wired into, is a concrete answer to "design
+   me an order book" that most candidates only gesture at abstractly.
 
 This is a much stronger story than "I built a project" — it demonstrates
 the actual discipline (verify before trusting, measure before claiming,

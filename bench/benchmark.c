@@ -248,5 +248,73 @@ int main(void) {
                rescan_ns_per_call);
     }
 
+    // Isolate the cost of ob_cancel_order_opt (whole-book linear scan) vs
+    // ob_cancel_order_opt_indexed (O(1)-amortized hashed lookup), both at
+    // the SAME worst-case position: bids/asks[0..N-2] filled to capacity
+    // with non-mine liquidity, and the order under test placed last in
+    // asks[MAX_PRICE_LEVELS-1] — the last slot find_live_mine_order's
+    // linear scan would ever reach, since it walks all bids levels before
+    // any asks level. Both variants get the identical setup, so this
+    // isolates the algorithmic difference, not a lucky/unlucky position.
+    {
+        static L3OrderBook ob_lin, ob_idx;
+        static EngineAccount acc_lin, acc_idx;
+        static OrderIndex idx; // ORDER_INDEX_CAPACITY buckets — static, not on the stack
+
+        ob_init_opt(&ob_lin, &acc_lin, 100);
+        ob_init_opt(&ob_idx, &acc_idx, 100);
+        ob_index_init(&idx);
+        // Bypass the normal "earn inventory via a market buy" path — this
+        // is a latency microbenchmark for cancel, not a test of sell-side
+        // placement rules, and both engines need enough inventory to place
+        // repeated limit sells without the risk-limit/inventory check
+        // ever getting in the way of the measurement.
+        acc_lin.my_inventory = 1000000;
+        acc_idx.my_inventory = 1000000;
+
+        for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
+            while (ob_add_order_opt(&ob_lin.bids[i], (L3Order){acc_lin.global_order_id++, 5, 0, 0, 0})) {}
+            while (ob_add_order_opt(&ob_idx.bids[i], (L3Order){acc_idx.global_order_id++, 5, 0, 0, 0})) {}
+        }
+        for (int i = 0; i < MAX_PRICE_LEVELS - 1; i++) {
+            while (ob_add_order_opt(&ob_lin.asks[i], (L3Order){acc_lin.global_order_id++, 5, 0, 0, 0})) {}
+            while (ob_add_order_opt(&ob_idx.asks[i], (L3Order){acc_idx.global_order_id++, 5, 0, 0, 0})) {}
+        }
+        int last = MAX_PRICE_LEVELS - 1;
+        while (ob_lin.asks[last].order_count < MAX_ORDERS_PER_LVL - 1) {
+            ob_add_order_opt(&ob_lin.asks[last], (L3Order){acc_lin.global_order_id++, 5, 0, 0, 0});
+            ob_add_order_opt(&ob_idx.asks[last], (L3Order){acc_idx.global_order_id++, 5, 0, 0, 0});
+        }
+
+        const int CANCEL_CALLS = 500000;
+        long long lin_ns = 0, idx_ns = 0;
+
+        for (int i = 0; i < CANCEL_CALLS; i++) {
+            int id = ob_place_limit_sell_opt(&ob_lin, &acc_lin, last, 1); // untimed setup
+            long long t0 = now_ns();
+            ob_cancel_order_opt(&ob_lin, &acc_lin, id);                  // TIMED: whole-book scan
+            lin_ns += now_ns() - t0;
+            ob_clean_ghosts_opt(&ob_lin.asks[last]);                     // untimed: reclaim the slot
+        }
+        for (int i = 0; i < CANCEL_CALLS; i++) {
+            int id = ob_place_limit_sell_opt_indexed(&ob_idx, &acc_idx, &idx, last, 1); // untimed
+            long long t0 = now_ns();
+            ob_cancel_order_opt_indexed(&ob_idx, &acc_idx, &idx, id);    // TIMED: hashed lookup
+            idx_ns += now_ns() - t0;
+            ob_clean_ghosts_opt(&ob_idx.asks[last]);                     // untimed: reclaim the slot
+        }
+
+        printf("[Cancel-by-id, worst-case position (last slot of the last ask level, "
+               "book depth %d), %d calls each]\n", MAX_ORDERS_PER_LVL, CANCEL_CALLS);
+        printf("  linear scan (ob_cancel_order_opt)        : %lld ns total -> %.1f ns/call\n",
+               lin_ns, (double)lin_ns / CANCEL_CALLS);
+        printf("  indexed     (ob_cancel_order_opt_indexed) : %lld ns total -> %.1f ns/call\n",
+               idx_ns, (double)idx_ns / CANCEL_CALLS);
+        printf("  speedup: %.2fx\n", (double)lin_ns / (double)idx_ns);
+        printf("  (at this depth the linear scan visits up to %d order slots per call; "
+               "the indexed lookup does not grow with depth)\n\n",
+               2 * MAX_PRICE_LEVELS * MAX_ORDERS_PER_LVL);
+    }
+
     return 0;
 }

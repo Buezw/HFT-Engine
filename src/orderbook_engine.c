@@ -18,7 +18,7 @@
 void ob_clean_ghosts_baseline(L3PriceLevel *lvl) {
     int w = 0;
     for (int r = 0; r < lvl->order_count; r++) {
-        if (lvl->queue[r].visual_fx != 2 && lvl->queue[r].qty > 0) {
+        if (lvl->queue[r].state != 2 && lvl->queue[r].qty > 0) {
             lvl->queue[w++] = lvl->queue[r];
         }
     }
@@ -29,12 +29,12 @@ void ob_update_total_qty_baseline(L3OrderBook *ob) {
     for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
         int sb = 0, sa = 0;
         for (int q = 0; q < ob->bids[i].order_count; q++) {
-            if (ob->bids[i].queue[q].visual_fx != 2) sb += ob->bids[i].queue[q].qty;
+            if (ob->bids[i].queue[q].state != 2) sb += ob->bids[i].queue[q].qty;
         }
         ob->bids[i].total_qty = sb;
 
         for (int q = 0; q < ob->asks[i].order_count; q++) {
-            if (ob->asks[i].queue[q].visual_fx != 2) sa += ob->asks[i].queue[q].qty;
+            if (ob->asks[i].queue[q].state != 2) sa += ob->asks[i].queue[q].qty;
         }
         ob->asks[i].total_qty = sa;
     }
@@ -44,7 +44,7 @@ void ob_market_buy_baseline(L3OrderBook *ob, EngineAccount *acc, int qty, int is
     for (int i = 0; i < MAX_PRICE_LEVELS && qty > 0; i++) {
         for (int q = 0; q < ob->asks[i].order_count && qty > 0; q++) {
             L3Order *ord = &ob->asks[i].queue[q];
-            if (ord->qty <= 0 || ord->visual_fx == 2) continue;
+            if (ord->qty <= 0 || ord->state == 2) continue;
             if (is_player && ord->is_mine) continue;
 
             int fill = (qty < ord->qty) ? qty : ord->qty;
@@ -62,7 +62,7 @@ void ob_market_buy_baseline(L3OrderBook *ob, EngineAccount *acc, int qty, int is
 
             if (ord->qty == 0) {
                 ord->ghost_qty = prev;
-                ord->visual_fx = 2;
+                ord->state = 2;
             }
         }
     }
@@ -72,7 +72,7 @@ void ob_market_sell_baseline(L3OrderBook *ob, EngineAccount *acc, int qty, int i
     for (int i = 0; i < MAX_PRICE_LEVELS && qty > 0; i++) {
         for (int q = 0; q < ob->bids[i].order_count && qty > 0; q++) {
             L3Order *ord = &ob->bids[i].queue[q];
-            if (ord->qty <= 0 || ord->visual_fx == 2) continue;
+            if (ord->qty <= 0 || ord->state == 2) continue;
             if (is_player && ord->is_mine) continue;
 
             int fill = (qty < ord->qty) ? qty : ord->qty;
@@ -90,7 +90,7 @@ void ob_market_sell_baseline(L3OrderBook *ob, EngineAccount *acc, int qty, int i
 
             if (ord->qty == 0) {
                 ord->ghost_qty = prev;
-                ord->visual_fx = 2;
+                ord->state = 2;
             }
         }
     }
@@ -164,11 +164,11 @@ void ob_update_total_qty_opt(L3OrderBook *ob) {
     for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
         int sb = 0, sa = 0;
         for (int q = 0; q < ob->bids[i].order_count; q++) {
-            if (ob->bids[i].queue[q].visual_fx != 2) sb += ob->bids[i].queue[q].qty;
+            if (ob->bids[i].queue[q].state != 2) sb += ob->bids[i].queue[q].qty;
         }
         ob->bids[i].total_qty = sb;
         for (int q = 0; q < ob->asks[i].order_count; q++) {
-            if (ob->asks[i].queue[q].visual_fx != 2) sa += ob->asks[i].queue[q].qty;
+            if (ob->asks[i].queue[q].state != 2) sa += ob->asks[i].queue[q].qty;
         }
         ob->asks[i].total_qty = sa;
     }
@@ -179,7 +179,7 @@ void ob_clean_ghosts_opt(L3PriceLevel *lvl) {
     // compaction entirely (no writes to lvl->queue at all).
     int needs_cleanup = 0;
     for (int r = 0; r < lvl->order_count; r++) {
-        if (lvl->queue[r].visual_fx == 2 || lvl->queue[r].qty <= 0) {
+        if (lvl->queue[r].state == 2 || lvl->queue[r].qty <= 0) {
             needs_cleanup = 1;
             break;
         }
@@ -188,7 +188,7 @@ void ob_clean_ghosts_opt(L3PriceLevel *lvl) {
 
     int w = 0;
     for (int r = 0; r < lvl->order_count; r++) {
-        if (lvl->queue[r].visual_fx != 2 && lvl->queue[r].qty > 0) {
+        if (lvl->queue[r].state != 2 && lvl->queue[r].qty > 0) {
             lvl->queue[w++] = lvl->queue[r];
         }
     }
@@ -201,7 +201,7 @@ void ob_market_buy_opt(L3OrderBook *ob, EngineAccount *acc, int qty, int is_play
         int filled_here = 0;
         for (int q = 0; q < lvl->order_count && qty > 0; q++) {
             L3Order *ord = &lvl->queue[q];
-            if (ord->qty <= 0 || ord->visual_fx == 2 || (is_player && ord->is_mine)) continue;
+            if (ord->qty <= 0 || ord->state == 2 || (is_player && ord->is_mine)) continue;
 
             int fill = (qty < ord->qty) ? qty : ord->qty;
             int prev = ord->qty;
@@ -219,7 +219,7 @@ void ob_market_buy_opt(L3OrderBook *ob, EngineAccount *acc, int qty, int is_play
 
             if (ord->qty == 0) {
                 ord->ghost_qty = prev;
-                ord->visual_fx = 2;
+                ord->state = 2;
             }
         }
         // Incremental maintenance instead of a full O(orders) rescan later.
@@ -233,7 +233,7 @@ void ob_market_sell_opt(L3OrderBook *ob, EngineAccount *acc, int qty, int is_pla
         int filled_here = 0;
         for (int q = 0; q < lvl->order_count && qty > 0; q++) {
             L3Order *ord = &lvl->queue[q];
-            if (ord->qty <= 0 || ord->visual_fx == 2 || (is_player && ord->is_mine)) continue;
+            if (ord->qty <= 0 || ord->state == 2 || (is_player && ord->is_mine)) continue;
 
             int fill = (qty < ord->qty) ? qty : ord->qty;
             int prev = ord->qty;
@@ -251,7 +251,7 @@ void ob_market_sell_opt(L3OrderBook *ob, EngineAccount *acc, int qty, int is_pla
 
             if (ord->qty == 0) {
                 ord->ghost_qty = prev;
-                ord->visual_fx = 2;
+                ord->state = 2;
             }
         }
         lvl->total_qty -= filled_here;
@@ -374,13 +374,13 @@ static L3Order *find_live_mine_order(L3OrderBook *ob, int order_id, int *out_is_
     for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
         for (int q = 0; q < ob->bids[i].order_count; q++) {
             L3Order *o = &ob->bids[i].queue[q];
-            if (o->order_id == order_id && o->is_mine && o->qty > 0 && o->visual_fx != 2) {
+            if (o->order_id == order_id && o->is_mine && o->qty > 0 && o->state != 2) {
                 *out_is_bid = 1; *out_level = i; return o;
             }
         }
         for (int q = 0; q < ob->asks[i].order_count; q++) {
             L3Order *o = &ob->asks[i].queue[q];
-            if (o->order_id == order_id && o->is_mine && o->qty > 0 && o->visual_fx != 2) {
+            if (o->order_id == order_id && o->is_mine && o->qty > 0 && o->state != 2) {
                 *out_is_bid = 0; *out_level = i; return o;
             }
         }
@@ -396,7 +396,7 @@ int ob_cancel_order_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id) 
     int qty = o->qty;
     o->ghost_qty = qty;
     o->qty = 0;
-    o->visual_fx = 2; // same ghost mechanism a full fill uses; ob_clean_ghosts_* compacts it out later
+    o->state = 2; // same ghost mechanism a full fill uses; ob_clean_ghosts_* compacts it out later
 
     if (is_bid) acc->my_cash += (long)qty * ob->bids[level].price;
     else        acc->my_inventory += qty;
@@ -411,7 +411,7 @@ int ob_cancel_order_opt(L3OrderBook *ob, EngineAccount *acc, int order_id) {
     int qty = o->qty;
     o->ghost_qty = qty;
     o->qty = 0;
-    o->visual_fx = 2;
+    o->state = 2;
 
     if (is_bid) {
         acc->my_cash += (long)qty * ob->bids[level].price;
@@ -460,4 +460,142 @@ int ob_market_sell_risk_checked_opt(L3OrderBook *ob, EngineAccount *acc, int qty
     int clipped = (qty < room) ? qty : room;
     ob_market_sell_opt(ob, acc, clipped, /*is_player=*/1);
     return clipped;
+}
+
+// ============================================================================
+// O(1) CANCEL-BY-ID INDEX — see header for the full design rationale (why
+// it's a separate struct instead of extra fields on L3Order/L3PriceLevel,
+// why ob_clean_ghosts_opt is left untouched, why the fallback is bounded
+// to one level instead of requiring perfect invariants across a shared
+// compaction routine).
+// ============================================================================
+
+#define ORDER_INDEX_EMPTY     (-1)
+#define ORDER_INDEX_TOMBSTONE (-2)
+
+static uint32_t order_index_hash(int32_t order_id) {
+    return (uint32_t)order_id * 2654435761u; // Knuth multiplicative hash
+}
+
+void ob_index_init(OrderIndex *idx) {
+    for (int i = 0; i < ORDER_INDEX_CAPACITY; i++) {
+        idx->buckets[i].order_id = ORDER_INDEX_EMPTY;
+    }
+}
+
+// Linear-probe insert. Stops at the first EMPTY *or* TOMBSTONE bucket, so
+// slots freed by order_index_remove get reused — without that, a long
+// run of place/cancel pairs (see the randomized stress test) would fill
+// the table with tombstones and never free capacity back up.
+static void order_index_insert(OrderIndex *idx, int32_t order_id, L3PriceLevel *lvl, int slot, int is_bid) {
+    uint32_t h = order_index_hash(order_id) & (ORDER_INDEX_CAPACITY - 1);
+    for (int i = 0; i < ORDER_INDEX_CAPACITY; i++) {
+        uint32_t b = (h + (uint32_t)i) & (ORDER_INDEX_CAPACITY - 1);
+        int32_t cur = idx->buckets[b].order_id;
+        if (cur == ORDER_INDEX_EMPTY || cur == ORDER_INDEX_TOMBSTONE) {
+            idx->buckets[b].order_id = order_id;
+            idx->buckets[b].lvl      = lvl;
+            idx->buckets[b].slot     = (uint16_t)slot;
+            idx->buckets[b].is_bid   = (uint8_t)is_bid;
+            return;
+        }
+    }
+    // Table full: capacity is sized with headroom for every depth this
+    // project tests (see header). Unreachable in practice; a silent
+    // no-op rather than a crash if it ever is reached — losing the O(1)
+    // fast path for one order just means the cancel below won't find it
+    // in the index and reports "not found" instead of corrupting memory.
+}
+
+// Probing MUST continue past tombstones (only an EMPTY bucket terminates
+// the search) — a tombstone means "something used to be here", not "the
+// probe chain stops here".
+static int order_index_lookup(const OrderIndex *idx, int32_t order_id,
+                               L3PriceLevel **out_lvl, int *out_slot, int *out_is_bid) {
+    uint32_t h = order_index_hash(order_id) & (ORDER_INDEX_CAPACITY - 1);
+    for (int i = 0; i < ORDER_INDEX_CAPACITY; i++) {
+        uint32_t b = (h + (uint32_t)i) & (ORDER_INDEX_CAPACITY - 1);
+        int32_t cur = idx->buckets[b].order_id;
+        if (cur == ORDER_INDEX_EMPTY) return 0; // never inserted
+        if (cur == order_id) {
+            *out_lvl    = idx->buckets[b].lvl;
+            *out_slot   = idx->buckets[b].slot;
+            *out_is_bid = idx->buckets[b].is_bid;
+            return 1;
+        }
+        // tombstone or a different id occupying this bucket: keep probing
+    }
+    return 0;
+}
+
+static void order_index_remove(OrderIndex *idx, int32_t order_id) {
+    uint32_t h = order_index_hash(order_id) & (ORDER_INDEX_CAPACITY - 1);
+    for (int i = 0; i < ORDER_INDEX_CAPACITY; i++) {
+        uint32_t b = (h + (uint32_t)i) & (ORDER_INDEX_CAPACITY - 1);
+        int32_t cur = idx->buckets[b].order_id;
+        if (cur == ORDER_INDEX_EMPTY) return; // not present
+        if (cur == order_id) {
+            idx->buckets[b].order_id = ORDER_INDEX_TOMBSTONE;
+            return;
+        }
+    }
+}
+
+int ob_place_limit_buy_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int level, int qty) {
+    int id = ob_place_limit_buy_opt(ob, acc, level, qty);
+    if (id < 0) return -1;
+    L3PriceLevel *lvl = &ob->bids[level];
+    order_index_insert(idx, id, lvl, lvl->order_count - 1, /*is_bid=*/1);
+    return id;
+}
+
+int ob_place_limit_sell_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int level, int qty) {
+    int id = ob_place_limit_sell_opt(ob, acc, level, qty);
+    if (id < 0) return -1;
+    L3PriceLevel *lvl = &ob->asks[level];
+    order_index_insert(idx, id, lvl, lvl->order_count - 1, /*is_bid=*/0);
+    return id;
+}
+
+int ob_cancel_order_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int order_id) {
+    (void)ob; // the cached level pointer carries everything needed; kept as a
+              // parameter only for calling-convention symmetry with ob_cancel_order_opt
+    L3PriceLevel *lvl = NULL;
+    int slot = -1, is_bid = 0;
+    if (!order_index_lookup(idx, order_id, &lvl, &slot, &is_bid)) return 0;
+
+    L3Order *o = NULL;
+    if (slot >= 0 && slot < lvl->order_count &&
+        lvl->queue[slot].order_id == order_id && lvl->queue[slot].is_mine &&
+        lvl->queue[slot].qty > 0 && lvl->queue[slot].state != 2) {
+        o = &lvl->queue[slot]; // O(1) fast path: cached slot still valid
+    } else {
+        // Cache stale — a compaction moved this order since it was placed
+        // or last found. Bounded fallback: rescan only this ONE level
+        // (see header comment), never the rest of the book.
+        for (int q = 0; q < lvl->order_count; q++) {
+            if (lvl->queue[q].order_id == order_id && lvl->queue[q].is_mine &&
+                lvl->queue[q].qty > 0 && lvl->queue[q].state != 2) {
+                o = &lvl->queue[q];
+                break;
+            }
+        }
+    }
+
+    if (!o) {
+        order_index_remove(idx, order_id); // already gone; drop the stale entry
+        return 0;
+    }
+
+    int qty = o->qty;
+    o->ghost_qty = qty;
+    o->qty = 0;
+    o->state = 2;
+
+    if (is_bid) acc->my_cash += (long)qty * lvl->price;
+    else        acc->my_inventory += qty;
+    lvl->total_qty -= qty;
+
+    order_index_remove(idx, order_id);
+    return 1;
 }

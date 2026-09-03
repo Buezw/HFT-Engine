@@ -600,6 +600,236 @@ static int test_risk_limit_end_to_end(void) {
     return fails;
 }
 
+// ============================================================================
+// Test 6: O(1) cancel-by-id index (ob_cancel_order_opt_indexed).
+//
+// The index is purely a performance layer: for any given sequence of
+// placements/cancels, it must produce EXACTLY the same account and book
+// mutations as the existing, already-proven ob_cancel_order_opt. Three
+// things are checked, in order:
+//   6a. the O(1) fast path itself (cancel immediately after placement,
+//       cached slot still valid, no compaction has run)
+//   6b. the bounded single-level fallback (force a compaction that shifts
+//       the target order to a new slot within its level *before*
+//       cancelling it, so the cached slot is stale and the fallback scan
+//       has to actually run and still find it)
+//   6c. behavioral equivalence with ob_cancel_order_opt under the same
+//       randomized mixed workload used in test_random_stress, diffing
+//       full book+account state after every operation
+// ============================================================================
+static int test_indexed_cancel_fast_path(void) {
+    L3OrderBook ob; EngineAccount acc;
+    static OrderIndex idx; // 128KB (ORDER_INDEX_CAPACITY buckets) — static, not on the stack
+    ob_init_opt(&ob, &acc, 100);
+    ob_index_init(&idx);
+    int fails = 0;
+
+    long cash_before = acc.my_cash;
+    int id = ob_place_limit_buy_opt_indexed(&ob, &acc, &idx, 0, 20);
+    if (id < 0) {
+        printf("FAIL: indexed limit buy placement rejected unexpectedly\n");
+        return 1;
+    }
+    long expect_reserved = (long)20 * ob.bids[0].price;
+    if (acc.my_cash != cash_before - expect_reserved) {
+        printf("FAIL: indexed placement did not reserve cash correctly\n");
+        fails++;
+    }
+
+    // No clean_ghosts call in between: the cached (level, slot) from
+    // placement must still be exactly right, so this hits the O(1) path,
+    // not the fallback scan.
+    if (!ob_cancel_order_opt_indexed(&ob, &acc, &idx, id)) {
+        printf("FAIL: indexed cancel of a freshly-placed order was rejected\n");
+        fails++;
+    }
+    if (acc.my_cash != cash_before) {
+        printf("FAIL: indexed cancel did not refund cash exactly (got %ld, expected %ld)\n",
+               acc.my_cash, cash_before);
+        fails++;
+    }
+
+    // Double-cancel and bogus-id must both fail cleanly, same contract as
+    // ob_cancel_order_opt.
+    if (ob_cancel_order_opt_indexed(&ob, &acc, &idx, id)) {
+        printf("FAIL: indexed double-cancel was accepted\n");
+        fails++;
+    }
+    if (ob_cancel_order_opt_indexed(&ob, &acc, &idx, 999999)) {
+        printf("FAIL: indexed cancel of a nonexistent id was accepted\n");
+        fails++;
+    }
+
+    if (fails == 0) {
+        printf("PASS: indexed cancel O(1) fast path (place, immediate cancel, "
+               "refund, double-cancel rejection, bogus-id rejection) all correct\n");
+    }
+    return fails;
+}
+
+static int test_indexed_cancel_stale_fallback(void) {
+    L3OrderBook ob; EngineAccount acc;
+    static OrderIndex idx;
+    ob_init_opt(&ob, &acc, 100);
+    ob_index_init(&idx);
+    int fails = 0;
+
+    // ob_init_opt already seeded bids[0] with 3 market-maker orders (slots
+    // 0-2). Place the order under test after them, so it lands at slot 3
+    // — the index caches that slot at placement time.
+    long cash_before = acc.my_cash;
+    int id = ob_place_limit_buy_opt_indexed(&ob, &acc, &idx, 0, 20);
+    if (id < 0) {
+        printf("FAIL: setup placement rejected unexpectedly\n");
+        return 1;
+    }
+    int cached_slot_at_placement = ob.bids[0].order_count - 1;
+
+    // Ghost the FIRST of the pre-seeded orders (slot 0, ahead of the order
+    // under test) and compact — this shifts every surviving order down by
+    // one slot, including `id`'s, exactly the staleness scenario the
+    // fallback exists for.
+    ob.bids[0].queue[0].qty = 0;
+    ob.bids[0].queue[0].state = 2;
+    ob_clean_ghosts_opt(&ob.bids[0]);
+
+    int actual_slot_now = -1;
+    for (int q = 0; q < ob.bids[0].order_count; q++) {
+        if (ob.bids[0].queue[q].order_id == id) { actual_slot_now = q; break; }
+    }
+    if (actual_slot_now < 0) {
+        printf("FAIL: test setup lost track of the target order after compaction\n");
+        return 1;
+    }
+    if (actual_slot_now == cached_slot_at_placement) {
+        printf("FAIL: test setup didn't actually shift the target order's slot "
+               "(still at %d) — fallback wouldn't be exercised\n", actual_slot_now);
+        return 1;
+    }
+
+    // idx still thinks `id` is at slot 2 — stale. This must still succeed,
+    // via the bounded single-level fallback scan.
+    if (!ob_cancel_order_opt_indexed(&ob, &acc, &idx, id)) {
+        printf("FAIL: indexed cancel failed to find an order after its cached "
+               "slot went stale (fallback scan did not work)\n");
+        fails++;
+    }
+    if (acc.my_cash != cash_before) {
+        printf("FAIL: indexed cancel via fallback did not refund cash exactly "
+               "(got %ld, expected %ld)\n", acc.my_cash, cash_before);
+        fails++;
+    }
+
+    if (fails == 0) {
+        printf("PASS: indexed cancel correctly falls back to a single-level scan "
+               "when a compaction has staled the cached slot\n");
+    }
+    return fails;
+}
+
+static int test_indexed_cancel_equivalence(void) {
+    L3OrderBook ob_a, ob_b;   // ob_a: existing ob_cancel_order_opt; ob_b: indexed
+    EngineAccount acc_a, acc_b;
+    static OrderIndex idx;
+    ob_init_opt(&ob_a, &acc_a, 100);
+    ob_init_opt(&ob_b, &acc_b, 100);
+    ob_index_init(&idx);
+
+    rng_state = 0x1DEA5u; // fixed seed, independent of the other stress tests' streams
+    int fails = 0;
+
+    #define MAX_ISSUED 4096
+    int issued_ids[MAX_ISSUED];
+    int issued_count = 0;
+
+    const int ITERATIONS = 50000;
+    for (int i = 0; i < ITERATIONS && fails == 0; i++) {
+        int action = rand_range(0, 99);
+        int level = rand_range(0, MAX_PRICE_LEVELS - 1);
+        int qty = rand_range(1, 25);
+
+        if (action < 35) {
+            int is_player = rand_range(0, 3) == 0;
+            if (rand_range(0, 1)) {
+                ob_market_buy_opt(&ob_a, &acc_a, qty, is_player);
+                ob_market_buy_opt(&ob_b, &acc_b, qty, is_player);
+            } else {
+                ob_market_sell_opt(&ob_a, &acc_a, qty, is_player);
+                ob_market_sell_opt(&ob_b, &acc_b, qty, is_player);
+            }
+        } else if (action < 70) {
+            int id_a, id_b;
+            if (rand_range(0, 1)) {
+                id_a = ob_place_limit_buy_opt(&ob_a, &acc_a, level, qty);
+                id_b = ob_place_limit_buy_opt_indexed(&ob_b, &acc_b, &idx, level, qty);
+            } else {
+                id_a = ob_place_limit_sell_opt(&ob_a, &acc_a, level, qty);
+                id_b = ob_place_limit_sell_opt_indexed(&ob_b, &acc_b, &idx, level, qty);
+            }
+            if (id_a != id_b) {
+                printf("FAIL at iter %d: placement id diverged (plain=%d indexed=%d)\n",
+                       i, id_a, id_b);
+                fails++;
+            }
+            if (id_a >= 0 && issued_count < MAX_ISSUED) {
+                issued_ids[issued_count++] = id_a;
+            }
+        } else if (action < 90 && issued_count > 0) {
+            int id = issued_ids[rand_range(0, issued_count - 1)];
+            int r_a = ob_cancel_order_opt(&ob_a, &acc_a, id);
+            int r_b = ob_cancel_order_opt_indexed(&ob_b, &acc_b, &idx, id);
+            if (r_a != r_b) {
+                printf("FAIL at iter %d: cancel(%d) result diverged (plain=%d indexed=%d)\n",
+                       i, id, r_a, r_b);
+                fails++;
+            }
+        } else {
+            int bogus_id = rand_range(2000000, 3000000);
+            int r_a = ob_cancel_order_opt(&ob_a, &acc_a, bogus_id);
+            int r_b = ob_cancel_order_opt_indexed(&ob_b, &acc_b, &idx, bogus_id);
+            if (r_a || r_b) {
+                printf("FAIL at iter %d: cancel of a bogus id was accepted "
+                       "(plain=%d indexed=%d)\n", i, r_a, r_b);
+                fails++;
+            }
+        }
+
+        for (int lvl = 0; lvl < MAX_PRICE_LEVELS; lvl++) {
+            ob_clean_ghosts_opt(&ob_a.bids[lvl]);
+            ob_clean_ghosts_opt(&ob_b.bids[lvl]);
+            ob_clean_ghosts_opt(&ob_a.asks[lvl]);
+            ob_clean_ghosts_opt(&ob_b.asks[lvl]);
+        }
+
+        if (!accounts_equal(&acc_a, &acc_b)) {
+            printf("FAIL at iter %d: account state diverged between plain and "
+                   "indexed cancel (plain cash=%ld inv=%d, indexed cash=%ld inv=%d)\n",
+                   i, acc_a.my_cash, acc_a.my_inventory, acc_b.my_cash, acc_b.my_inventory);
+            fails++;
+        }
+        if (!books_equal(&ob_a, &ob_b)) {
+            printf("FAIL at iter %d: book state diverged between plain and indexed cancel\n", i);
+            fails++;
+        }
+    }
+    #undef MAX_ISSUED
+
+    if (fails == 0) {
+        printf("PASS: %d randomized operations, ob_cancel_order_opt_indexed produced "
+               "identical account+book state to ob_cancel_order_opt at every step "
+               "(%d order ids issued)\n", ITERATIONS, issued_count);
+    }
+    return fails;
+}
+
+static int test_indexed_cancel(void) {
+    int failures = 0;
+    failures += test_indexed_cancel_fast_path();
+    failures += test_indexed_cancel_stale_fallback();
+    failures += test_indexed_cancel_equivalence();
+    return failures;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_tick_replay();
@@ -608,6 +838,7 @@ int main(void) {
     failures += test_random_stress();
     failures += test_risk_limit_clipping();
     failures += test_risk_limit_end_to_end();
+    failures += test_indexed_cancel();
 
     if (failures == 0) {
         printf("\nALL TESTS PASSED\n");
