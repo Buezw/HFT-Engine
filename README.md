@@ -30,6 +30,7 @@ bench/benchmark.c            baseline-vs-optimized timing: mean, percentiles, de
 tools/book_trace.c           runs a scenario against the opt engine, dumps per-tick JSON
 tools/render_trace.py        wraps the JSON trace into a self-contained HTML replay
 tools/visualizer_template.html  the replay page itself (ladder + inventory/PnL/depth charts)
+tools/capability_map.html    static reference: every public function, plain-language, no code reading required
 include/spsc_ring.h / src/spsc_ring.c   lock-free single-producer/single-consumer queue
 tests/test_spsc_ring.c       FIFO/capacity boundary tests + a real 2M-item multithreaded stress test
 bench/threaded_bench.c       measures whether splitting receive/match onto two threads helps or hurts
@@ -502,6 +503,19 @@ quoting/inventory-skew logic added next either needs its own price-walk
 mechanism, or needs to be honest that it's optimizing spread capture against
 a market that structurally cannot move.
 
+## Capability map
+
+`tools/capability_map.html` — a static, no-build-step reference page for
+everyone (including future-me) who needs to know what this engine can do
+without reading `orderbook_engine.h`: every public function grouped by
+what it's for, in plain language, colored by baseline (blue) vs opt
+(amber), plus a diagram of a resting order's actual lifecycle (place →
+resting → `modify_qty` in place vs `modify_price`'s cancel-old+place-new
+→ cancelled/filled) and a real depth-scaling chart of the indexed-vs-
+linear-scan numbers (re-measured at 6 depths, not just the two points
+quoted elsewhere in this README). Open it directly in a browser — no
+`make` target, nothing to generate, it's just a file.
+
 ## Threaded ingestion: does splitting receive from matching actually help?
 
 The engine's matching functions (`ob_market_*_opt` etc.) are, and stay,
@@ -594,6 +608,7 @@ make tsan         # rebuild test_spsc_ring with clang -fsanitize=thread and run 
 make cppcheck     # static analysis over src/, bench/, tests/
 make depth-sweep  # ~35s: the table in the Results section above, regenerated live
 make visualize    # builds build/book_visualizer.html — open it in a browser
+open tools/capability_map.html  # static reference, no build step, no code reading
 make threaded-bench  # the receive/match threading comparison above, regenerated live
 make clean        # remove build/
 ```

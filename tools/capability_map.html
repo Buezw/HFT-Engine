@@ -1,0 +1,440 @@
+<title>HFT-Engine Capability Map</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --bg:#0b0f14; --surface:#121820; --surface-2:#171f29; --raised:#1c2530;
+    --border:#25303d; --border-soft:#1b2531;
+    --text:#e7ecf1; --text-muted:#8b98a8; --text-faint:#5d6b7a;
+    --opt:#e8a33d; --opt-dim:#4a3a1e;
+    --base:#5b8fb0; --base-dim:#22303a;
+    --good:#4caf7d; --warn:#d1595f;
+    --mono:'IBM Plex Mono',ui-monospace,'SFMono-Regular',Menlo,Consolas,monospace;
+    --sans:'IBM Plex Sans',ui-sans-serif,system-ui,-apple-system,sans-serif;
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --bg:#eef1f4; --surface:#ffffff; --surface-2:#f5f7f9; --raised:#ffffff;
+      --border:#d7dee5; --border-soft:#e3e8ec;
+      --text:#182129; --text-muted:#5b6b7a; --text-faint:#8a97a5;
+      --opt:#a86a17; --opt-dim:#f4e3c6;
+      --base:#2f6690; --base-dim:#dbe8f0;
+      --good:#2f8a5f; --warn:#b83e46;
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#eef1f4; --surface:#ffffff; --surface-2:#f5f7f9; --raised:#ffffff;
+    --border:#d7dee5; --border-soft:#e3e8ec;
+    --text:#182129; --text-muted:#5b6b7a; --text-faint:#8a97a5;
+    --opt:#a86a17; --opt-dim:#f4e3c6;
+    --base:#2f6690; --base-dim:#dbe8f0;
+    --good:#2f8a5f; --warn:#b83e46;
+  }
+
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:var(--sans); line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+  }
+  .page{ max-width:920px; margin:0 auto; padding:56px 24px 80px; }
+
+  h1,h2,h3{ font-family:var(--sans); font-weight:700; text-wrap:balance; margin:0; }
+  code,.mono{ font-family:var(--mono); }
+  .num{ font-variant-numeric:tabular-nums; }
+
+  /* ---------- header ---------- */
+  .eyebrow{
+    font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--text-faint); margin:0 0 10px;
+  }
+  h1{ font-size:32px; letter-spacing:-0.01em; }
+  .subtitle{ color:var(--text-muted); font-size:16px; max-width:62ch; margin:14px 0 0; }
+  .subtitle b{ color:var(--text); font-weight:600; }
+
+  /* ---------- legend ---------- */
+  .legend{
+    display:flex; gap:20px; flex-wrap:wrap; margin-top:28px; padding:14px 18px;
+    background:var(--surface); border:1px solid var(--border); border-radius:10px;
+    font-size:13px; color:var(--text-muted);
+  }
+  .legend-item{ display:flex; align-items:center; gap:8px; }
+  .dot{ width:9px; height:9px; border-radius:50%; flex:none; }
+  .dot.opt{ background:var(--opt); }
+  .dot.base{ background:var(--base); }
+
+  /* ---------- stat strip ---------- */
+  .stats{
+    display:grid; grid-template-columns:repeat(4,1fr); gap:1px;
+    background:var(--border); border:1px solid var(--border); border-radius:10px;
+    overflow:hidden; margin-top:28px;
+  }
+  .stat{ background:var(--surface); padding:16px 18px; }
+  .stat .v{ font-family:var(--mono); font-size:22px; font-weight:600; color:var(--text); }
+  .stat .l{ font-size:12px; color:var(--text-muted); margin-top:4px; }
+
+  /* ---------- section shell ---------- */
+  section{ margin-top:56px; }
+  .sec-head{ display:flex; align-items:baseline; gap:12px; margin-bottom:18px; }
+  .sec-no{ font-family:var(--mono); font-size:12px; color:var(--text-faint); }
+  h2{ font-size:20px; }
+  .sec-desc{ color:var(--text-muted); font-size:14.5px; max-width:66ch; margin:10px 0 22px; }
+
+  /* ---------- diagram ---------- */
+  figure{ margin:0; }
+  .diagram-wrap{
+    background:var(--surface); border:1px solid var(--border); border-radius:12px;
+    padding:20px; overflow-x:auto;
+  }
+  svg.diagram{ width:100%; height:auto; display:block; min-width:560px; }
+  figcaption{ font-size:13px; color:var(--text-muted); margin-top:12px; }
+
+  /* ---------- capability blocks ---------- */
+  .cap{
+    background:var(--surface); border:1px solid var(--border); border-radius:12px;
+    padding:22px 24px; display:flex; flex-direction:column; gap:14px;
+  }
+  .cap + .cap{ margin-top:14px; }
+  .cap-title{ font-size:16px; font-weight:600; }
+  .cap-desc{ color:var(--text-muted); font-size:14.5px; max-width:68ch; }
+  .fnlist{ display:flex; flex-direction:column; gap:6px; }
+  .fnrow{
+    display:grid; grid-template-columns:22px 1fr; gap:10px; align-items:start;
+    font-family:var(--mono); font-size:13px; padding:7px 10px;
+    background:var(--surface-2); border:1px solid var(--border-soft); border-radius:7px;
+  }
+  .fnrow .tag{ width:8px; height:8px; border-radius:50%; margin-top:5px; }
+  .fnrow .tag.opt{ background:var(--opt); }
+  .fnrow .tag.base{ background:var(--base); }
+  .fnrow .tag.both{ background:linear-gradient(90deg,var(--base) 50%,var(--opt) 50%); }
+  .fnrow .sig{ color:var(--text); word-break:break-word; }
+  .fnrow .sig .fn{ font-weight:600; }
+  .fnrow .note{ color:var(--text-muted); font-size:12px; margin-top:3px; font-family:var(--sans); }
+
+  .metric{
+    display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;
+    background:var(--surface-2); border:1px solid var(--border-soft); border-radius:8px;
+    padding:12px 16px; font-size:13.5px;
+  }
+  .metric .big{ font-family:var(--mono); font-size:20px; font-weight:600; color:var(--opt); }
+  .metric .ctx{ color:var(--text-muted); }
+
+  .finding{
+    border-left:3px solid var(--warn); padding:10px 14px; background:var(--surface-2);
+    border-radius:0 8px 8px 0; font-size:13.5px; color:var(--text-muted);
+  }
+  .finding b{ color:var(--text); }
+
+  /* ---------- footer ---------- */
+  footer{
+    margin-top:64px; padding-top:24px; border-top:1px solid var(--border);
+    color:var(--text-faint); font-size:12.5px; display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap;
+  }
+
+  @media (max-width:640px){
+    .stats{ grid-template-columns:repeat(2,1fr); }
+    h1{ font-size:26px; }
+  }
+</style>
+
+<div class="page">
+
+  <p class="eyebrow">github.com/Buezw/HFT-Engine &middot; src/orderbook_engine.c</p>
+  <h1>这个引擎到底能干什么</h1>
+  <p class="subtitle">不用看代码的功能清单——每个能力配一句大白话说明，加上对应的函数名（方便回代码里查），<b style="color:var(--base)">蓝色</b>是 baseline（main.c 原样搬过来的行为），<b style="color:var(--opt)">琥珀色</b>是 opt（优化版，外部行为一致，内部更快）。</p>
+
+  <div class="legend">
+    <div class="legend-item"><span class="dot base"></span> baseline — main.c 的忠实移植，永远不改，用来当"标准答案"</div>
+    <div class="legend-item"><span class="dot opt"></span> opt — 优化版，外部行为跟 baseline 完全一致，靠 200k-tick 回放 + 随机压测证明</div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="v num">29</div><div class="l">个公开函数</div></div>
+    <div class="stat"><div class="v num">8</div><div class="l">组测试，含 3 个 5 万次随机压测</div></div>
+    <div class="stat"><div class="v num">47.4×</div><div class="l">索引查找 vs 线性扫描（深度 400）</div></div>
+    <div class="stat"><div class="v num">-168,805</div><div class="l">无风控时库存能跑多偏（已修复）</div></div>
+  </div>
+
+  <!-- ================= LIFECYCLE DIAGRAM ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-no">01</span><h2>一笔挂单的一生</h2></div>
+    <p class="sec-desc">这是最容易读代码也读不出来的部分——一笔挂单从"挂上"到"消失"之间，到底能被谁、怎么改。</p>
+
+    <figure>
+      <div class="diagram-wrap">
+        <svg class="diagram" viewBox="0 0 900 380" role="img" aria-label="订单生命周期图：Place 挂单进入 Resting 状态；modify_qty 原地改数量并绕回 Resting；modify_price 撤旧单并生成一个新的 Resting 订单；Cancel 或 Filled 让订单退出为 Gone。">
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+            </marker>
+          </defs>
+          <g fill="none" stroke="currentColor" stroke-width="1.5" font-family="IBM Plex Mono, monospace">
+
+            <!-- Place -->
+            <rect x="20" y="150" width="130" height="56" rx="8"/>
+            <text x="85" y="174" text-anchor="middle" fill="currentColor" font-size="13" stroke="none">place</text>
+            <text x="85" y="192" text-anchor="middle" fill="currentColor" font-size="10.5" stroke="none" opacity="0.65">ob_place_limit_*</text>
+
+            <!-- Resting -->
+            <rect x="245" y="140" width="160" height="76" rx="8" stroke-width="2"/>
+            <text x="325" y="170" text-anchor="middle" fill="currentColor" font-size="14" stroke="none" font-weight="600">Resting</text>
+            <text x="325" y="188" text-anchor="middle" fill="currentColor" font-size="10.5" stroke="none" opacity="0.65">同一个 order_id</text>
+            <text x="325" y="202" text-anchor="middle" fill="currentColor" font-size="10.5" stroke="none" opacity="0.65">同一个队列位置</text>
+
+            <line x1="150" y1="178" x2="245" y2="178" marker-end="url(#arrow)"/>
+
+            <!-- modify_qty self loop -->
+            <path d="M 285 140 C 275 95, 375 95, 365 140" stroke-width="1.5" marker-end="url(#arrow)"/>
+            <text x="325" y="88" text-anchor="middle" fill="currentColor" font-size="11" stroke="none">modify_qty</text>
+            <text x="325" y="102" text-anchor="middle" fill="currentColor" font-size="10" stroke="none" opacity="0.6">原地改数量，id/排队位置不变</text>
+
+            <!-- modify_price -> new Resting -->
+            <rect x="560" y="30" width="180" height="76" rx="8" stroke-width="2" stroke-dasharray="4 3"/>
+            <text x="650" y="60" text-anchor="middle" fill="currentColor" font-size="14" stroke="none" font-weight="600">Resting（新单）</text>
+            <text x="650" y="78" text-anchor="middle" fill="currentColor" font-size="10.5" stroke="none" opacity="0.65">新的 order_id</text>
+            <text x="650" y="92" text-anchor="middle" fill="currentColor" font-size="10.5" stroke="none" opacity="0.65">新价位队尾</text>
+
+            <path d="M 380 140 C 420 100, 480 75, 560 65" marker-end="url(#arrow)"/>
+            <text x="470" y="88" text-anchor="middle" fill="currentColor" font-size="11" stroke="none">modify_price</text>
+            <text x="470" y="101" text-anchor="middle" fill="currentColor" font-size="10" stroke="none" opacity="0.6">先挂新单成功，才撤旧单</text>
+
+            <!-- Cancel -->
+            <line x1="325" y1="216" x2="325" y2="290" marker-end="url(#arrow)"/>
+            <text x="345" y="258" text-anchor="start" fill="currentColor" font-size="11" stroke="none">cancel</text>
+            <text x="345" y="271" text-anchor="start" fill="currentColor" font-size="10" stroke="none" opacity="0.6">退还现金/库存</text>
+
+            <!-- Filled -->
+            <line x1="405" y1="192" x2="520" y2="222" marker-end="url(#arrow)"/>
+            <text x="450" y="195" text-anchor="middle" fill="currentColor" font-size="11" stroke="none">filled</text>
+            <text x="450" y="208" text-anchor="middle" fill="currentColor" font-size="10" stroke="none" opacity="0.6">被市场单吃掉一部分/全部</text>
+
+            <!-- Gone -->
+            <rect x="245" y="290" width="160" height="56" rx="8" stroke="var(--text-faint)" opacity="0.75"/>
+            <text x="325" y="314" text-anchor="middle" fill="currentColor" font-size="13" stroke="none" opacity="0.8">Gone</text>
+            <text x="325" y="331" text-anchor="middle" fill="currentColor" font-size="10" stroke="none" opacity="0.55">ghost → 下次 compaction 清理</text>
+
+            <rect x="520" y="200" width="160" height="56" rx="8" stroke="var(--text-faint)" opacity="0.75"/>
+            <text x="600" y="224" text-anchor="middle" fill="currentColor" font-size="13" stroke="none" opacity="0.8">Gone</text>
+            <text x="600" y="241" text-anchor="middle" fill="currentColor" font-size="10" stroke="none" opacity="0.55">同上</text>
+          </g>
+        </svg>
+      </div>
+      <figcaption>改数量（<code>modify_qty</code>）是原地改，排队位置不丢；改价位（<code>modify_price</code>）诚实地建模成"先挂新单成功、再撤旧单"，会拿到一个新 id、排到新价位队尾——这是真实交易所的规则，不是简化。</figcaption>
+    </figure>
+  </section>
+
+  <!-- ================= MATCHING ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-no">02</span><h2>撮合核心</h2></div>
+    <p class="sec-desc">市价单怎么吃掉盘口——从最优价位开始，一档一档往后吃，直到吃满或者没货了。</p>
+    <div class="cap">
+      <div class="fnlist">
+        <div class="fnrow"><span class="tag base"></span><div><div class="sig"><span class="fn">ob_market_buy_baseline</span> / <span class="fn">ob_market_sell_baseline</span></div><div class="note">main.c 原始逻辑：逐档吃单，自成交（is_mine）在玩家自己下单时会被跳过</div></div></div>
+        <div class="fnrow"><span class="tag opt"></span><div><div class="sig"><span class="fn">ob_market_buy_opt</span> / <span class="fn">ob_market_sell_opt</span></div><div class="note">同样的外部行为，内部把 total_qty 顺手维护好，不用每 tick 重新扫一遍</div></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= LIFECYCLE FUNCTIONS ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-no">03</span><h2>挂单生命周期</h2></div>
+    <p class="sec-desc">main.c 从来没写过"自己挂一个限价单"的功能——虽然到处都在检查 is_mine，就是没有地方把它设成 1。这一整块是补全的，不是移植的。</p>
+    <div class="cap">
+      <div class="fnlist">
+        <div class="fnrow"><span class="tag both"></span><div><div class="sig"><span class="fn">ob_place_limit_buy_*</span> / <span class="fn">ob_place_limit_sell_*</span></div><div class="note">挂一笔限价单，买单立刻冻结现金、卖单立刻冻结库存——跟真实限价单一样，挂上就占用资金</div></div></div>
+        <div class="fnrow"><span class="tag both"></span><div><div class="sig"><span class="fn">ob_cancel_order_*</span></div><div class="note">按 id 撤单，退还冻结的资金/库存；重复撤同一个单会被拒绝，不会退两次钱</div></div></div>
+        <div class="fnrow"><span class="tag both"></span><div><div class="sig"><span class="fn">ob_modify_qty_*</span></div><div class="note">原地改数量：id、队列位置都不变，加量要有钱/有货，不够就拒绝，什么都不改</div></div></div>
+        <div class="fnrow"><span class="tag both"></span><div><div class="sig"><span class="fn">ob_modify_price_*</span></div><div class="note">挪价位：本质是撤旧单+挂新单，拿新 id；新单挂失败的话旧单原样保留，不会两头落空</div></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= RISK ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-no">04</span><h2>风控</h2></div>
+    <p class="sec-desc">main.c 的市价单完全没有仓位上限——随机压测直接把库存打到 -168,805，暴露出这个洞之后才补上的。</p>
+    <div class="cap">
+      <div class="fnlist">
+        <div class="fnrow"><span class="tag both"></span><div><div class="sig"><span class="fn">ob_market_buy_risk_checked_*</span> / <span class="fn">ob_market_sell_risk_checked_*</span></div><div class="note">套在市价单外面的一层，把请求数量削减到 <code>MAX_POSITION</code>（500）以内——削减、不是直接拒绝，0 笔成交也是合法结果</div></div></div>
+      </div>
+      <div class="finding"><b>只管玩家自己的仓位</b>——模拟盘口那边的市场噪音单不归这个风控管，因为那不是"自己的仓位"。</div>
+    </div>
+  </section>
+
+  <!-- ================= INDEX ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-no">05</span><h2>O(1) 索引</h2></div>
+    <p class="sec-desc">书浅的时候（板子上实际只有 60 笔单子）挨个扫一遍完全不是问题；书一旦变深，"挨个扫"就扫不动了。</p>
+    <div class="cap">
+      <div class="fnlist">
+        <div class="fnrow"><span class="tag opt"></span><div><div class="sig"><span class="fn">ob_place_limit_*_opt_indexed</span> / <span class="fn">ob_cancel_order_opt_indexed</span></div><div class="note">挂单/撤单的同时维护一张 order_id → 位置 的哈希表</div></div></div>
+        <div class="fnrow"><span class="tag opt"></span><div><div class="sig"><span class="fn">ob_modify_qty_opt_indexed</span> / <span class="fn">ob_modify_price_opt_indexed</span></div><div class="note">改单也走同一张哈希表，不用重新扫全书</div></div></div>
+      </div>
+      <figure>
+        <div class="diagram-wrap">
+          <svg class="diagram" viewBox="0 0 660 260" role="img" aria-label="折线图：随着书的深度从 10 增加到 400，线性扫描每次调用的耗时从约 47 纳秒涨到约 1060 纳秒；索引查找始终维持在约 22 纳秒，几乎不随深度变化。">
+            <g font-family="IBM Plex Mono, monospace" font-size="11">
+              <!-- gridlines + y labels -->
+              <g stroke="var(--border)" stroke-width="1">
+                <line x1="60" y1="220" x2="600" y2="220"/>
+                <line x1="60" y1="174" x2="600" y2="174"/>
+                <line x1="60" y1="129" x2="600" y2="129"/>
+                <line x1="60" y1="83"  x2="600" y2="83"/>
+                <line x1="60" y1="38"  x2="600" y2="38"/>
+              </g>
+              <g fill="var(--text-faint)" text-anchor="end">
+                <text x="52" y="223">0</text>
+                <text x="52" y="177">250</text>
+                <text x="52" y="132">500</text>
+                <text x="52" y="86">750</text>
+                <text x="52" y="41">1000ns</text>
+              </g>
+
+              <!-- x labels (depth, categorical spacing) -->
+              <g fill="var(--text-faint)" text-anchor="middle">
+                <text x="60"  y="238">10</text>
+                <text x="168" y="238">25</text>
+                <text x="276" y="238">50</text>
+                <text x="384" y="238">100</text>
+                <text x="492" y="238">200</text>
+                <text x="600" y="238">400</text>
+                <text x="330" y="255" font-family="IBM Plex Sans, sans-serif" fill="var(--text-muted)">book depth (MAX_ORDERS_PER_LVL)</text>
+              </g>
+
+              <!-- linear scan line (average of cancel + modify_qty measurements) -->
+              <polyline points="60,211 168,201 276,192 384,161 492,120 600,28"
+                        fill="none" stroke="var(--warn)" stroke-width="2.5"/>
+              <g fill="var(--warn)">
+                <circle cx="60" cy="211" r="3"/><circle cx="168" cy="201" r="3"/><circle cx="276" cy="192" r="3"/>
+                <circle cx="384" cy="161" r="3"/><circle cx="492" cy="120" r="3"/><circle cx="600" cy="28" r="3"/>
+              </g>
+              <text x="605" y="24" fill="var(--warn)" text-anchor="start" font-weight="600">1060ns</text>
+
+              <!-- indexed line -->
+              <polyline points="60,216 168,215 276,215 384,216 492,216 600,215"
+                        fill="none" stroke="var(--good)" stroke-width="2.5"/>
+              <g fill="var(--good)">
+                <circle cx="60" cy="216" r="3"/><circle cx="168" cy="215" r="3"/><circle cx="276" cy="215" r="3"/>
+                <circle cx="384" cy="216" r="3"/><circle cx="492" cy="216" r="3"/><circle cx="600" cy="215" r="3"/>
+              </g>
+              <text x="605" y="219" fill="var(--good)" text-anchor="start" font-weight="600">~22ns</text>
+            </g>
+          </svg>
+        </div>
+        <figcaption>
+          <span style="color:var(--warn); font-weight:600;">● 线性扫描</span>（<code>ob_cancel_order_opt</code> / <code>ob_modify_qty_opt</code>，两者几乎重合，取平均画一条线）随深度增长逼近线性上涨；
+          <span style="color:var(--good); font-weight:600;">● 索引查找</span>（<code>_opt_indexed</code> 变体）全程压在 ~22ns，几乎看不出随深度变化——这就是 O(1) 这三个字在图上的样子。数据来自本机重新跑的 <code>bench/benchmark.c</code>，6 个深度各测 50 万次调用。
+        </figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ================= CONCURRENCY ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-no">06</span><h2>并发基础设施</h2></div>
+    <p class="sec-desc">撮合本身永远单线程（一本账必须按顺序处理）。能并行的是"收单子"和"真正撮合"这两件事。</p>
+    <div class="cap">
+      <figure>
+        <div class="diagram-wrap">
+          <svg class="diagram" viewBox="0 0 700 300" role="img" aria-label="架构对比图：单线程版本里，收消息的随机等待和撮合挤在同一条时间线上，撮合永远排在等待后面；拆分成两个线程后，收消息线程独自承受等待，通过一个队列把消息交给撮合线程，撮合线程可以背靠背连续处理，不再被单次等待直接卡住。">
+            <defs>
+              <marker id="arrow2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+              </marker>
+            </defs>
+            <g font-family="IBM Plex Mono, monospace" font-size="11">
+
+              <!-- ===== Board A: single thread ===== -->
+              <text x="20" y="18" font-size="12" font-weight="600" fill="currentColor">A. 单线程</text>
+              <rect x="20" y="30" width="660" height="40" rx="6" fill="none" stroke="var(--border)"/>
+              <g fill="var(--warn)" opacity="0.28">
+                <rect x="20"  y="30" width="90"  height="40"/>
+                <rect x="150" y="30" width="60"  height="40"/>
+                <rect x="250" y="30" width="110" height="40"/>
+                <rect x="400" y="30" width="70"  height="40"/>
+                <rect x="510" y="30" width="100" height="40"/>
+              </g>
+              <g fill="var(--opt)" opacity="0.55">
+                <rect x="110" y="30" width="40" height="40"/>
+                <rect x="210" y="30" width="40" height="40"/>
+                <rect x="360" y="30" width="40" height="40"/>
+                <rect x="470" y="30" width="40" height="40"/>
+                <rect x="610" y="30" width="40" height="40"/>
+              </g>
+              <text x="330" y="86" text-anchor="middle" fill="var(--text-muted)" font-family="IBM Plex Sans, sans-serif" font-size="12">收消息的等待和撮合挤在同一条时间线 → 撮合永远排在等待后面</text>
+
+              <!-- ===== Board B: split threads ===== -->
+              <text x="20" y="128" font-size="12" font-weight="600" fill="currentColor">B. 拆成收单线程 + 撮合线程</text>
+
+              <text x="20" y="150" font-size="10.5" fill="var(--text-muted)" font-family="IBM Plex Sans, sans-serif">收单线程</text>
+              <rect x="90" y="140" width="590" height="34" rx="6" fill="none" stroke="var(--border)"/>
+              <g fill="var(--warn)" opacity="0.28">
+                <rect x="90"  y="140" width="90"  height="34"/>
+                <rect x="196" y="140" width="60"  height="34"/>
+                <rect x="272" y="140" width="110" height="34"/>
+                <rect x="398" y="140" width="70"  height="34"/>
+                <rect x="484" y="140" width="100" height="34"/>
+              </g>
+
+              <!-- queue icon -->
+              <g transform="translate(330,192)">
+                <rect x="-34" y="-16" width="68" height="32" rx="6" fill="var(--base)" fill-opacity="0.18" stroke="var(--base)" stroke-width="1.5"/>
+                <circle cx="-16" cy="0" r="3.5" fill="var(--base)"/>
+                <circle cx="0" cy="0" r="3.5" fill="var(--base)"/>
+                <circle cx="16" cy="0" r="3.5" fill="var(--base)"/>
+                <text x="0" y="-22" text-anchor="middle" fill="var(--base)" font-weight="600">spsc_ring</text>
+              </g>
+              <line x1="220" y1="174" x2="308" y2="176" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow2)"/>
+              <text x="240" y="188" fill="currentColor" opacity="0.75">push</text>
+              <line x1="352" y1="208" x2="440" y2="210" stroke="currentColor" stroke-width="1.3" marker-end="url(#arrow2)"/>
+              <text x="400" y="206" fill="currentColor" opacity="0.75">pop</text>
+
+              <text x="20" y="225" font-size="10.5" fill="var(--text-muted)" font-family="IBM Plex Sans, sans-serif">撮合线程</text>
+              <rect x="90" y="210" width="590" height="34" rx="6" fill="none" stroke="var(--border)"/>
+              <g fill="var(--opt)" opacity="0.55">
+                <rect x="90"  y="210" width="46" height="34"/>
+                <rect x="142" y="210" width="46" height="34"/>
+                <rect x="194" y="210" width="46" height="34"/>
+                <rect x="246" y="210" width="46" height="34"/>
+                <rect x="298" y="210" width="46" height="34"/>
+                <rect x="350" y="210" width="46" height="34"/>
+                <rect x="402" y="210" width="46" height="34"/>
+                <rect x="454" y="210" width="46" height="34"/>
+                <rect x="506" y="210" width="46" height="34"/>
+                <rect x="558" y="210" width="46" height="34"/>
+                <rect x="610" y="210" width="46" height="34"/>
+              </g>
+              <text x="330" y="266" text-anchor="middle" fill="var(--text-muted)" font-family="IBM Plex Sans, sans-serif" font-size="12">撮合线程只做一件事：从队列里取一条、处理、再取下一条——背靠背，不再被单次等待卡住</text>
+            </g>
+          </svg>
+        </div>
+        <figcaption>
+          <span style="color:var(--warn); font-weight:600;">■ 收消息的不确定等待</span>（对应真实系统里的 socket 读取/解析），
+          <span style="color:var(--opt); font-weight:600;">■ 撮合</span>。A 图里两者串在一条线上；B 图把等待挪到独立的一条线程，用 <code>spsc_ring</code> 传给撮合线程。
+        </figcaption>
+      </figure>
+      <div class="fnlist">
+        <div class="fnrow"><span class="tag opt"></span><div><div class="sig"><span class="fn">spsc_push</span> / <span class="fn">spsc_pop</span></div><div class="note">无锁的单生产者/单消费者队列，两个线程之间传消息不用加锁</div></div></div>
+      </div>
+      <div class="finding"><b>意外发现：</b>把两个线程强行绑定到指定 CPU 核心上，反而制造出一个稳定复现的 ~12.5ms 超长卡顿——这是台大家共用的机器，绑核心相当于关掉了操作系统"帮你避开拥堵"的能力。</div>
+    </div>
+  </section>
+
+  <!-- ================= VERIFICATION ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-no">07</span><h2>验证与工具</h2></div>
+    <p class="sec-desc">这个项目的核心纪律：先证明"一样"，才谈"更快"。</p>
+    <div class="cap">
+      <div class="fnlist">
+        <div class="fnrow"><span class="tag both"></span><div><div class="sig">tests/test_correctness.c</div><div class="note">200k-tick 回放 + 3 组各 5 万次随机压测，每一步都比对 baseline/opt 状态</div></div></div>
+        <div class="fnrow"><span class="tag both"></span><div><div class="sig">tests/test_spsc_ring.c</div><div class="note">200 万条消息的真·双线程压测，专门跑在 ThreadSanitizer 下（ASan 抓不到数据竞争）</div></div></div>
+        <div class="fnrow"><span class="tag both"></span><div><div class="sig">bench/*.c + make visualize</div><div class="note">延迟分布（p50/p99）、深度扫描、可拖动的网页版盘口回放</div></div></div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>src/orderbook_engine.c · include/orderbook_engine.h · include/spsc_ring.h</span>
+    <span>baseline 与 opt 的等价性由 memcmp(L3OrderBook) 逐字节验证</span>
+  </footer>
+
+</div>
