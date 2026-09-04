@@ -1,8 +1,9 @@
 # HFT Order Book Engine — Optimization & Benchmark
 
 CI workflow: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (runs
-`make test`, `make bench`, `make asan`, `make cppcheck` on every push/PR —
-badge omitted until this is pushed to a repo GitHub can render status for).
+`make test`, `make bench`, `make asan`, `make tsan`, `make cppcheck` on
+every push/PR — badge omitted until this is pushed to a repo GitHub can
+render status for).
 License: [MIT](LICENSE).
 
 ## What this is
@@ -29,9 +30,12 @@ bench/benchmark.c            baseline-vs-optimized timing: mean, percentiles, de
 tools/book_trace.c           runs a scenario against the opt engine, dumps per-tick JSON
 tools/render_trace.py        wraps the JSON trace into a self-contained HTML replay
 tools/visualizer_template.html  the replay page itself (ladder + inventory/PnL/depth charts)
+include/spsc_ring.h / src/spsc_ring.c   lock-free single-producer/single-consumer queue
+tests/test_spsc_ring.c       FIFO/capacity boundary tests + a real 2M-item multithreaded stress test
+bench/threaded_bench.c       measures whether splitting receive/match onto two threads helps or hurts
 scripts/format_depth_sweep.awk  tabulates `make depth-sweep` output
-Makefile                     test / bench / asan / cppcheck / depth-sweep / visualize / clean targets
-.github/workflows/ci.yml     runs test / bench / asan / cppcheck on every push/PR
+Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep / visualize / threaded-bench / clean targets
+.github/workflows/ci.yml     runs test / bench / asan / tsan / cppcheck on every push/PR
 ```
 
 - `board/main.c` — the original bare-metal program, with one real bug fixed
@@ -73,6 +77,15 @@ Makefile                     test / bench / asan / cppcheck / depth-sweep / visu
   `make depth-sweep`) how the gap between baseline and optimized scales
   as book depth grows past the board's real value, and a dedicated
   linear-scan-vs-indexed cancel comparison at a fixed worst-case position.
+- `include/spsc_ring.h` / `src/spsc_ring.c` — a lock-free single-producer/
+  single-consumer ring buffer, used by `bench/threaded_bench.c` to hand
+  messages from a "receiver" thread to the (still single-threaded)
+  matching thread. `tests/test_spsc_ring.c` covers FIFO order and the
+  exact capacity boundary, plus a real 2,000,000-item two-thread stress
+  test, clean under both ASan and — since a lock-free queue's actual risk
+  is a data race, not a memory-safety bug — ThreadSanitizer specifically
+  (`make tsan`). See "Threaded ingestion" below for what this is for and
+  what got measured.
 
 ## Bug fixed in `main.c`
 
@@ -410,15 +423,99 @@ quoting/inventory-skew logic added next either needs its own price-walk
 mechanism, or needs to be honest that it's optimizing spread capture against
 a market that structurally cannot move.
 
+## Threaded ingestion: does splitting receive from matching actually help?
+
+The engine's matching functions (`ob_market_*_opt` etc.) are, and stay,
+single-threaded — that's not a limitation to fix, it's correct: one order
+book is one sequential state machine, and price-time priority requires
+processing events in order. Locking the *existing* single book and calling
+its matching functions from multiple threads wouldn't parallelize
+anything real; it would just make every operation wait for a lock with
+nothing happening concurrently underneath it — strictly worse, not an
+optimization.
+
+The place multithreading legitimately fits: decoupling *receiving* a
+message (in reality: a socket read, packet reassembly, parsing — work
+with real, unpredictable tail latency that has nothing to do with the
+matching logic) from *matching* it, so a slow/jittery receive doesn't
+stall the matching thread directly. That only requires a
+single-producer/single-consumer channel between exactly one receiver
+thread and the one matching thread — no locks needed, since a lock-free
+SPSC ring buffer is correct precisely because each of `head`/`tail` is
+written by only one of the two threads, ever (`include/spsc_ring.h`).
+
+**Correctness came first, same as everywhere else in this project.**
+`tests/test_spsc_ring.c` proves FIFO ordering and the exact capacity
+boundary single-threaded, then runs a genuine two-thread stress test: one
+producer thread pushes 2,000,000 sequential integers, one consumer thread
+pops and asserts every single one arrives, in order, with nothing lost or
+duplicated. Critically, this was also run under **ThreadSanitizer**
+(`make tsan`), not just ASan — ASan catches memory-safety bugs, not data
+races, and a lock-free queue's entire risk surface *is* a potential data
+race on `head`/`tail`. Clean under both, which is what actually justifies
+trusting the `memory_order_acquire`/`memory_order_release` pairing in
+`spsc_ring.c` rather than just asserting it's correct because the logic
+looks textbook.
+
+**Then it was measured, not assumed to help** (`bench/threaded_bench.c`,
+`make threaded-bench`): a receiver thread injects randomized busy-spin
+"jitter" before each message (standing in for unpredictable receive-side
+cost) and pushes it into the ring; the matching thread pops and matches in
+a tight spin loop (no blocking wait — a blocking syscall in the hot path
+would defeat the entire point). The metric is the wall-clock gap between
+the start of one matching call and the next: in a single-threaded
+baseline that gap directly includes the jitter every time; if decoupling
+works, the matching thread's own gaps should stop tracking it.
+
+```
+baseline    p50=1.7-1.8us  p90=3.5-4.4us  p99=9-12.5us   max=19-45us
+unpinned    p50=1.7-1.8us  p90=3.3-4.8us  p99=6.7-12.6us max=21-81us
+pinned      p50=2.0-2.3us  p90=4.1-4.8us  p99=11.4-12.2us max=~12.5-12.9ms (!)
+```
+
+(ranges across several runs; `pinned` forces the matching thread onto core
+0 and the producer onto core 1 via `pthread_setaffinity_np`, to isolate
+whether OS scheduler bouncing explains `unpinned`'s numbers.)
+
+**The honest result: typical-case latency is a wash, and forced core
+pinning made the tail dramatically worse, not better — the opposite of
+the naive expectation.** `unpinned`'s p50/p90/p99 are essentially
+indistinguishable from `baseline`'s on this workload (the simulated
+jitter here is small enough, and this machine has 80 cores free enough,
+that the OS scheduler already keeps both threads running without
+forcing them to fight over one core). `pinned` is worse everywhere: a
+consistent, extremely tight ~12.5-12.9ms outlier appeared in *every*
+pinned run and never in `unpinned`/`baseline` — confirmed not a cgroup
+CPU quota artifact (`cpu.cfs_quota_us` is `-1`, unlimited, on this
+machine), but not root-caused further than that (this is a shared,
+multi-tenant machine, not a box under this project's control — proper
+root-causing would need `perf sched`, a NUMA topology check, and
+likely a dedicated/isolated core, none of which are available here).
+
+The takeaway that's actually defensible from this data: **pinning threads
+to specific cores is a technique that assumes you control the whole
+machine** (dedicated hardware, `isolcpus`, no other tenants) — it removes
+the OS scheduler's freedom to route a thread around momentary contention,
+and on a shared machine that freedom is doing real work you don't see
+until you take it away. Blindly pinning to arbitrary core numbers on
+infrastructure you don't fully control can make the tail dramatically
+worse in a way your p99 monitoring might not even catch — only `max`
+caught this, p99 looked fine. That's a more useful, more honest finding
+than "threading helped" or "threading didn't help" would have been on
+its own — it's a specific, measured statement about *when* a specific
+technique backfires, with the data to back it up.
+
 ## How to run it yourself
 
 ```bash
-make test         # build + run the replay, capacity, lifecycle, and stress tests
+make test         # build + run the replay, capacity, lifecycle, stress, and spsc_ring tests
 make bench        # runs `make test` first, then builds + runs the benchmark
 make asan         # rebuild the tests with clang -fsanitize=address,undefined and run them
+make tsan         # rebuild test_spsc_ring with clang -fsanitize=thread and run it
 make cppcheck     # static analysis over src/, bench/, tests/
 make depth-sweep  # ~35s: the table in the Results section above, regenerated live
 make visualize    # builds build/book_visualizer.html — open it in a browser
+make threaded-bench  # the receive/match threading comparison above, regenerated live
 make clean        # remove build/
 ```
 

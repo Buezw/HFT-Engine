@@ -20,6 +20,9 @@ jobs:
       - name: Build + run correctness tests under ASan/UBSan (clang)
         run: make asan
 
+      - name: Build + run spsc_ring stress test under ThreadSanitizer (clang)
+        run: make tsan
+
       - name: Static analysis (cppcheck)
         run: |
           sudo apt-get update
