@@ -51,11 +51,12 @@ Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep
   - plus a resting player limit-order lifecycle (`ob_place_limit_*`,
     `ob_cancel_order_*`) that completes a feature `main.c` only half-built
     (see below), a pre-trade position risk limit
-    (`ob_market_*_risk_checked_*`), and an O(1) cancel-by-id index
+    (`ob_market_*_risk_checked_*`), an O(1) cancel-by-id index
     (`OrderIndex`, `ob_place_limit_*_opt_indexed`,
-    `ob_cancel_order_opt_indexed`) — all new in the extracted engine, not
-    ports of anything in `main.c`.
-- `tests/test_correctness.c` — seven things, in order: (1) replays 200,000
+    `ob_cancel_order_opt_indexed`), and cancel-replace order modification
+    (`ob_modify_qty_*`, `ob_modify_price_*`, `+_opt_indexed`) — all new in
+    the extracted engine, not ports of anything in `main.c`.
+- `tests/test_correctness.c` — eight things, in order: (1) replays 200,000
   ticks of synthetic market-maker + player activity against both engines
   and asserts identical account state and book state after every tick —
   this has to pass before any benchmark number means anything; (2) a
@@ -70,13 +71,18 @@ Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep
   real matching on both engines; (7) the O(1) index's fast path, its
   bounded fallback when a compaction stales the cache, and a 50,000-
   iteration randomized run proving it's behaviorally identical to the
-  plain linear-scan cancel at every step.
+  plain linear-scan cancel at every step; (8) cancel-replace's
+  deterministic lifecycle, a 50,000-iteration randomized run mixing
+  modify_qty/modify_price into the existing workload (baseline vs opt),
+  and a second 50,000-iteration run proving the indexed modify variants
+  match the plain whole-book-scan ones.
 - `bench/benchmark.c` — measures baseline vs optimized under identical
   workload using `clock_gettime(CLOCK_MONOTONIC)`, reporting the mean,
   the p50/p90/p99/p99.9 latency distribution per tick, (via
   `make depth-sweep`) how the gap between baseline and optimized scales
-  as book depth grows past the board's real value, and a dedicated
-  linear-scan-vs-indexed cancel comparison at a fixed worst-case position.
+  as book depth grows past the board's real value, and dedicated
+  linear-scan-vs-indexed comparisons for both cancel and modify-qty at a
+  fixed worst-case position.
 - `include/spsc_ring.h` / `src/spsc_ring.c` — a lock-free single-producer/
   single-consumer ring buffer, used by `bench/threaded_bench.c` to hand
   messages from a "receiver" thread to the (still single-threaded)
@@ -308,6 +314,79 @@ The indexed lookup's cost doesn't move with depth (~21-22 ns/call at both
 10 and 400); the linear scan's grows roughly with it (24x more depth →
 ~24x more time). That's the O(1)-vs-O(n) story made concrete instead of
 just asserted.
+
+## Cancel-replace (order modification)
+
+Every existing way to change a resting order was cancel it, then place a
+brand-new one — which is fine for actually leaving the book, but wrong for
+the much more common case of a market maker adjusting a live quote: a
+real venue distinguishes a pure quantity change (never loses queue
+priority — nothing about *where* the order sits changed) from a price
+change (almost always loses priority — the order is now competing at a
+level it wasn't resting at before). Modeling both as "cancel + place" like
+everything else here already did would have been silently wrong for the
+quantity case and would have thrown away a real, testable distinction.
+
+Two functions instead of one "modify", because the underlying behavior
+genuinely isn't one thing:
+
+- `ob_modify_qty_baseline` / `ob_modify_qty_opt` (+ `_opt_indexed`) —
+  changes a resting order's quantity **in place**: same id, same
+  `(level, slot)`, same queue position. An increase reserves the
+  additional cash/inventory (rejected if it can't be covered); a decrease
+  refunds the difference. Nothing is mutated on rejection, same
+  discipline as every placement function above.
+- `ob_modify_price_baseline` / `ob_modify_price_opt` (+ `_opt_indexed`) —
+  moves an order to a different level. Modeled honestly as cancel-old +
+  place-new rather than pretending it's an in-place move: the result gets
+  a **new id** and goes to the back of the new level's queue, exactly
+  like a real cancel-replace that changes price would. Calling it at the
+  *same* level the order already rests at is a legal way to change qty
+  while deliberately giving up priority — the difference from
+  `ob_modify_qty_*` is exactly that trade-off, not a quirk.
+
+**Ordering matters and is deliberate:** `ob_modify_price_*` tries the new
+placement *first* and only cancels the old order if that succeeds. If the
+new placement is rejected (bad level, invalid qty, insufficient
+cash/inventory, full queue), the original order is left completely
+untouched — never a state where neither the old nor a new order exists.
+The stated cost of that safety: for a moment both the old and the new
+order's reservations are held at once, so this can reject a move that a
+venue netting collateral in real time would allow. Netting it instead
+would mean modifying `ob_place_limit_*_opt` itself (breaking the
+"wrapper, not a modification" rule the risk-limit and indexed-cancel
+features already committed to) or reimplementing reservation logic a
+third time — not worth it without evidence this ever actually blocks a
+legitimate move at this book's scale.
+
+The indexed variants share their O(1) lookup with `ob_cancel_order_opt_indexed`
+through one refactored-out helper (`find_indexed_live_order`) rather than a
+third copy of the same cache-hit/stale-fallback logic — the existing
+indexed-cancel tests were rerun after that refactor to make sure it changed
+nothing behaviorally, not just that it compiled.
+
+Tested the same way as everything else here: a deterministic lifecycle
+(increase, decrease, a rejected increase that leaves state untouched, a
+price move that gets a fresh id and leaves the old order gone, a rejected
+move that leaves the original live and unchanged) identical on baseline
+and opt; a 50,000-iteration randomized run mixing modify_qty/modify_price
+into the existing market/limit/cancel workload, diffing full state after
+every single operation; and a second 50,000-iteration run proving the
+indexed variants produce identical results to the plain whole-book-scan
+versions. All clean under `make asan`.
+
+Measured, not just argued, same methodology as the cancel benchmark above
+— a resting order pinned at the worst-case position, modified repeatedly:
+
+```
+depth=10:   linear scan   47.5 ns/call   indexed  22.1 ns/call   2.15x
+depth=400:  linear scan 1062.2 ns/call   indexed  22.4 ns/call  47.42x
+```
+
+Same shape as the cancel numbers, for the same reason (both share the
+underlying scan-vs-hash lookup) — and it's specifically the operation a
+market maker would call often (resizing/repricing a live quote), not the
+one that's cancel-old+place-new either way.
 
 ## Results (x86_64 dev machine, see caveat below)
 

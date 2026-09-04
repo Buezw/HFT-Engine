@@ -316,5 +316,67 @@ int main(void) {
                2 * MAX_PRICE_LEVELS * MAX_ORDERS_PER_LVL);
     }
 
+    // Same worst-case-position methodology, this time for ob_modify_qty_opt
+    // (uses the same whole-book linear scan cancel does internally) vs
+    // ob_modify_qty_opt_indexed (O(1) hashed lookup) — a single resting
+    // order at the last slot of the last ask level, modified repeatedly in
+    // place rather than cancelled+replaced each time.
+    {
+        static L3OrderBook ob_lin, ob_idx;
+        static EngineAccount acc_lin, acc_idx;
+        static OrderIndex idx;
+
+        ob_init_opt(&ob_lin, &acc_lin, 100);
+        ob_init_opt(&ob_idx, &acc_idx, 100);
+        ob_index_init(&idx);
+        acc_lin.my_inventory = 1000000;
+        acc_idx.my_inventory = 1000000;
+
+        for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
+            while (ob_add_order_opt(&ob_lin.bids[i], (L3Order){acc_lin.global_order_id++, 5, 0, 0, 0})) {}
+            while (ob_add_order_opt(&ob_idx.bids[i], (L3Order){acc_idx.global_order_id++, 5, 0, 0, 0})) {}
+        }
+        for (int i = 0; i < MAX_PRICE_LEVELS - 1; i++) {
+            while (ob_add_order_opt(&ob_lin.asks[i], (L3Order){acc_lin.global_order_id++, 5, 0, 0, 0})) {}
+            while (ob_add_order_opt(&ob_idx.asks[i], (L3Order){acc_idx.global_order_id++, 5, 0, 0, 0})) {}
+        }
+        int last = MAX_PRICE_LEVELS - 1;
+        while (ob_lin.asks[last].order_count < MAX_ORDERS_PER_LVL - 1) {
+            ob_add_order_opt(&ob_lin.asks[last], (L3Order){acc_lin.global_order_id++, 5, 0, 0, 0});
+            ob_add_order_opt(&ob_idx.asks[last], (L3Order){acc_idx.global_order_id++, 5, 0, 0, 0});
+        }
+        int lin_id = ob_place_limit_sell_opt(&ob_lin, &acc_lin, last, 5);
+        int idx_id = ob_place_limit_sell_opt_indexed(&ob_idx, &acc_idx, &idx, last, 5);
+
+        const int MODIFY_CALLS = 500000;
+        long long lin_ns = 0, idx_ns = 0;
+
+        for (int i = 0; i < MODIFY_CALLS; i++) {
+            int new_qty = (i % 2 == 0) ? 6 : 5; // small alternation: stays live, no rejection risk
+            long long t0 = now_ns();
+            ob_modify_qty_opt(&ob_lin, &acc_lin, lin_id, new_qty); // TIMED: whole-book scan
+            lin_ns += now_ns() - t0;
+        }
+        for (int i = 0; i < MODIFY_CALLS; i++) {
+            int new_qty = (i % 2 == 0) ? 6 : 5;
+            long long t0 = now_ns();
+            ob_modify_qty_opt_indexed(&ob_idx, &acc_idx, &idx, idx_id, new_qty); // TIMED: hashed lookup
+            idx_ns += now_ns() - t0;
+        }
+
+        printf("[Modify-qty-by-id, worst-case position (last slot of the last ask level, "
+               "book depth %d), %d calls each]\n", MAX_ORDERS_PER_LVL, MODIFY_CALLS);
+        printf("  linear scan (ob_modify_qty_opt)        : %lld ns total -> %.1f ns/call\n",
+               lin_ns, (double)lin_ns / MODIFY_CALLS);
+        printf("  indexed     (ob_modify_qty_opt_indexed) : %lld ns total -> %.1f ns/call\n",
+               idx_ns, (double)idx_ns / MODIFY_CALLS);
+        printf("  speedup: %.2fx\n", (double)lin_ns / (double)idx_ns);
+        printf("  (same story as cancel above: the indexed lookup does not grow with depth,\n"
+               "   which matters here specifically because a qty-only modify keeps its queue\n"
+               "   position — it's the operation you'd actually want to be cheap if you're\n"
+               "   repricing/resizing a resting quote often, not the price-changing kind that's\n"
+               "   cancel-old+place-new either way)\n\n");
+    }
+
     return 0;
 }

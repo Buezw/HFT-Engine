@@ -424,6 +424,81 @@ int ob_cancel_order_opt(L3OrderBook *ob, EngineAccount *acc, int order_id) {
 }
 
 // ============================================================================
+// CANCEL-REPLACE (order modification). See header for why quantity changes
+// and price/level changes are two different functions with two different
+// queue-priority behaviors, not one "modify" call.
+// ============================================================================
+int ob_modify_qty_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id, int new_qty) {
+    if (new_qty <= 0) return 0;
+    int is_bid, level;
+    L3Order *o = find_live_mine_order(ob, order_id, &is_bid, &level);
+    if (!o) return 0;
+
+    int delta = new_qty - o->qty;
+    if (is_bid) {
+        long cash_delta = (long)delta * ob->bids[level].price;
+        if (delta > 0 && cash_delta > acc->my_cash) return 0; // can't cover the increase
+        acc->my_cash -= cash_delta;
+    } else {
+        if (delta > 0 && delta > acc->my_inventory) return 0;
+        acc->my_inventory -= delta;
+    }
+    o->qty = new_qty;
+    // total_qty stays correct only after the next ob_update_total_qty_baseline()
+    // rescan — same as every other baseline mutation site, matching main.c.
+    return 1;
+}
+
+int ob_modify_qty_opt(L3OrderBook *ob, EngineAccount *acc, int order_id, int new_qty) {
+    if (new_qty <= 0) return 0;
+    int is_bid, level;
+    L3Order *o = find_live_mine_order(ob, order_id, &is_bid, &level);
+    if (!o) return 0;
+
+    L3PriceLevel *lvl = is_bid ? &ob->bids[level] : &ob->asks[level];
+    int delta = new_qty - o->qty;
+    if (is_bid) {
+        long cash_delta = (long)delta * lvl->price;
+        if (delta > 0 && cash_delta > acc->my_cash) return 0;
+        acc->my_cash -= cash_delta;
+    } else {
+        if (delta > 0 && delta > acc->my_inventory) return 0;
+        acc->my_inventory -= delta;
+    }
+    o->qty = new_qty;
+    lvl->total_qty += delta; // incremental, matches every other opt mutation site
+    return 1;
+}
+
+int ob_modify_price_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id, int new_level, int new_qty) {
+    int is_bid, level;
+    L3Order *o = find_live_mine_order(ob, order_id, &is_bid, &level);
+    if (!o) return -1;
+
+    int new_id = is_bid
+        ? ob_place_limit_buy_baseline(ob, acc, new_level, new_qty)
+        : ob_place_limit_sell_baseline(ob, acc, new_level, new_qty);
+    if (new_id < 0) return -1; // old order left completely untouched
+
+    ob_cancel_order_baseline(ob, acc, order_id); // refund the old reservation
+    return new_id;
+}
+
+int ob_modify_price_opt(L3OrderBook *ob, EngineAccount *acc, int order_id, int new_level, int new_qty) {
+    int is_bid, level;
+    L3Order *o = find_live_mine_order(ob, order_id, &is_bid, &level);
+    if (!o) return -1;
+
+    int new_id = is_bid
+        ? ob_place_limit_buy_opt(ob, acc, new_level, new_qty)
+        : ob_place_limit_sell_opt(ob, acc, new_level, new_qty);
+    if (new_id < 0) return -1;
+
+    ob_cancel_order_opt(ob, acc, order_id);
+    return new_id;
+}
+
+// ============================================================================
 // PRE-TRADE RISK LIMIT — a layer on top of ob_market_buy_*/ob_market_sell_*,
 // not a change to them. See header comment for the -168,805 stress-test
 // result that motivated this and why it wraps rather than modifies the
@@ -557,12 +632,18 @@ int ob_place_limit_sell_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIn
     return id;
 }
 
-int ob_cancel_order_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int order_id) {
-    (void)ob; // the cached level pointer carries everything needed; kept as a
-              // parameter only for calling-convention symmetry with ob_cancel_order_opt
+// Shared by ob_cancel_order_opt_indexed and the indexed modify functions
+// below: looks up order_id via the index, validates the cached slot, and
+// falls back to a bounded single-level rescan if the cache went stale
+// (see the header comment on OrderIndex for exactly when/why that
+// happens). Drops a stale index entry itself when the order can't be
+// found at all, so every caller gets that cleanup for free instead of
+// repeating it. Returns NULL (nothing found) or the live order, with
+// *out_lvl/*out_is_bid set to its level/side.
+static L3Order *find_indexed_live_order(OrderIndex *idx, int order_id, L3PriceLevel **out_lvl, int *out_is_bid) {
     L3PriceLevel *lvl = NULL;
     int slot = -1, is_bid = 0;
-    if (!order_index_lookup(idx, order_id, &lvl, &slot, &is_bid)) return 0;
+    if (!order_index_lookup(idx, order_id, &lvl, &slot, &is_bid)) return NULL;
 
     L3Order *o = NULL;
     if (slot >= 0 && slot < lvl->order_count &&
@@ -584,8 +665,20 @@ int ob_cancel_order_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex 
 
     if (!o) {
         order_index_remove(idx, order_id); // already gone; drop the stale entry
-        return 0;
+        return NULL;
     }
+    *out_lvl = lvl;
+    *out_is_bid = is_bid;
+    return o;
+}
+
+int ob_cancel_order_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int order_id) {
+    (void)ob; // the cached level pointer carries everything needed; kept as a
+              // parameter only for calling-convention symmetry with ob_cancel_order_opt
+    L3PriceLevel *lvl = NULL;
+    int is_bid = 0;
+    L3Order *o = find_indexed_live_order(idx, order_id, &lvl, &is_bid);
+    if (!o) return 0;
 
     int qty = o->qty;
     o->ghost_qty = qty;
@@ -598,4 +691,41 @@ int ob_cancel_order_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex 
 
     order_index_remove(idx, order_id);
     return 1;
+}
+
+int ob_modify_qty_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int order_id, int new_qty) {
+    (void)ob;
+    if (new_qty <= 0) return 0;
+    L3PriceLevel *lvl = NULL;
+    int is_bid = 0;
+    L3Order *o = find_indexed_live_order(idx, order_id, &lvl, &is_bid);
+    if (!o) return 0;
+
+    int delta = new_qty - o->qty;
+    if (is_bid) {
+        long cash_delta = (long)delta * lvl->price;
+        if (delta > 0 && cash_delta > acc->my_cash) return 0;
+        acc->my_cash -= cash_delta;
+    } else {
+        if (delta > 0 && delta > acc->my_inventory) return 0;
+        acc->my_inventory -= delta;
+    }
+    o->qty = new_qty;
+    lvl->total_qty += delta;
+    return 1;
+}
+
+int ob_modify_price_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int order_id, int new_level, int new_qty) {
+    L3PriceLevel *lvl = NULL;
+    int is_bid = 0;
+    L3Order *o = find_indexed_live_order(idx, order_id, &lvl, &is_bid);
+    if (!o) return -1;
+
+    int new_id = is_bid
+        ? ob_place_limit_buy_opt_indexed(ob, acc, idx, new_level, new_qty)
+        : ob_place_limit_sell_opt_indexed(ob, acc, idx, new_level, new_qty);
+    if (new_id < 0) return -1;
+
+    ob_cancel_order_opt_indexed(ob, acc, idx, order_id);
+    return new_id;
 }

@@ -23,6 +23,19 @@ static int accounts_equal(const EngineAccount *a, const EngineAccount *b) {
            a->total_fill_volume == b->total_fill_volume;
 }
 
+// Used by the cancel-replace tests below to verify a modified order
+// actually landed where it should have, not just that some return value
+// looked right.
+static int order_live_at(const L3OrderBook *ob, int is_bid, int level, int id, int expected_qty) {
+    const L3PriceLevel *lvl = is_bid ? &ob->bids[level] : &ob->asks[level];
+    for (int i = 0; i < lvl->order_count; i++) {
+        if (lvl->queue[i].order_id == id && lvl->queue[i].state != 2) {
+            return lvl->queue[i].qty == expected_qty;
+        }
+    }
+    return 0;
+}
+
 // ============================================================================
 // Test 1: 200k-tick behavioral replay, baseline vs opt (original test).
 // ============================================================================
@@ -830,6 +843,379 @@ static int test_indexed_cancel(void) {
     return failures;
 }
 
+// ============================================================================
+// Test 8: cancel-replace (ob_modify_qty_*, ob_modify_price_*).
+//
+// Same split the header documents: a qty-only modify keeps the order's id
+// and queue slot (no priority lost); a price/level modify is cancel-old +
+// place-new under the hood (new id, back of the new level's queue) and
+// must leave the old order completely untouched if the new placement is
+// rejected.
+// ============================================================================
+static int test_modify_order_lifecycle(void) {
+    L3OrderBook ob_base, ob_opt;
+    EngineAccount acc_base, acc_opt;
+    ob_init_baseline(&ob_base, &acc_base, 100);
+    ob_init_opt(&ob_opt, &acc_opt, 100);
+
+    int fails = 0;
+
+    int id_base = ob_place_limit_buy_baseline(&ob_base, &acc_base, 0, 20);
+    int id_opt  = ob_place_limit_buy_opt(&ob_opt, &acc_opt, 0, 20);
+    if (id_base < 0 || id_base != id_opt) {
+        printf("FAIL: setup placement diverged or failed (base=%d opt=%d)\n", id_base, id_opt);
+        fails++;
+    }
+
+    // --- modify_qty: increase, same id, same slot, extra cash reserved ---
+    long cash_before_inc_base = acc_base.my_cash, cash_before_inc_opt = acc_opt.my_cash;
+    int r_base = ob_modify_qty_baseline(&ob_base, &acc_base, id_base, 35);
+    int r_opt  = ob_modify_qty_opt(&ob_opt, &acc_opt, id_opt, 35);
+    long expect_extra = (long)(35 - 20) * ob_base.bids[0].price;
+    if (!r_base || !r_opt) {
+        printf("FAIL: modify_qty increase was rejected (base=%d opt=%d)\n", r_base, r_opt);
+        fails++;
+    }
+    if (acc_base.my_cash != cash_before_inc_base - expect_extra ||
+        acc_opt.my_cash  != cash_before_inc_opt  - expect_extra) {
+        printf("FAIL: modify_qty increase reserved the wrong amount of cash\n");
+        fails++;
+    }
+    if (!order_live_at(&ob_base, 1, 0, id_base, 35) || !order_live_at(&ob_opt, 1, 0, id_opt, 35)) {
+        printf("FAIL: modify_qty increase did not update the resting order in place\n");
+        fails++;
+    }
+
+    // --- modify_qty: decrease, refund the difference ---
+    long cash_before_dec_base = acc_base.my_cash, cash_before_dec_opt = acc_opt.my_cash;
+    r_base = ob_modify_qty_baseline(&ob_base, &acc_base, id_base, 5);
+    r_opt  = ob_modify_qty_opt(&ob_opt, &acc_opt, id_opt, 5);
+    long expect_refund = (long)(35 - 5) * ob_base.bids[0].price;
+    if (!r_base || !r_opt ||
+        acc_base.my_cash != cash_before_dec_base + expect_refund ||
+        acc_opt.my_cash  != cash_before_dec_opt  + expect_refund) {
+        printf("FAIL: modify_qty decrease did not refund the exact difference\n");
+        fails++;
+    }
+    if (!order_live_at(&ob_base, 1, 0, id_base, 5) || !order_live_at(&ob_opt, 1, 0, id_opt, 5)) {
+        printf("FAIL: modify_qty decrease did not update the resting order in place\n");
+        fails++;
+    }
+
+    // --- modify_qty: increase far beyond available cash must be rejected, untouched ---
+    long cash_before_reject_base = acc_base.my_cash, cash_before_reject_opt = acc_opt.my_cash;
+    r_base = ob_modify_qty_baseline(&ob_base, &acc_base, id_base, 10000000);
+    r_opt  = ob_modify_qty_opt(&ob_opt, &acc_opt, id_opt, 10000000);
+    if (r_base || r_opt ||
+        acc_base.my_cash != cash_before_reject_base || acc_opt.my_cash != cash_before_reject_opt ||
+        !order_live_at(&ob_base, 1, 0, id_base, 5) || !order_live_at(&ob_opt, 1, 0, id_opt, 5)) {
+        printf("FAIL: modify_qty increase beyond available cash was accepted or mutated state\n");
+        fails++;
+    }
+
+    // --- modify_qty: invalid new_qty and bogus id must both just fail ---
+    if (ob_modify_qty_baseline(&ob_base, &acc_base, id_base, 0) ||
+        ob_modify_qty_opt(&ob_opt, &acc_opt, id_opt, 0) ||
+        ob_modify_qty_baseline(&ob_base, &acc_base, 999999, 10) ||
+        ob_modify_qty_opt(&ob_opt, &acc_opt, 999999, 10)) {
+        printf("FAIL: modify_qty accepted a non-positive qty or a bogus order id\n");
+        fails++;
+    }
+
+    // --- modify_price: move to a different level, new id, old order gone ---
+    long cash_before_move_base = acc_base.my_cash, cash_before_move_opt = acc_opt.my_cash;
+    int new_id_base = ob_modify_price_baseline(&ob_base, &acc_base, id_base, 2, 12);
+    int new_id_opt  = ob_modify_price_opt(&ob_opt, &acc_opt, id_opt, 2, 12);
+    if (new_id_base < 0 || new_id_opt < 0 || new_id_base != new_id_opt || new_id_base == id_base) {
+        printf("FAIL: modify_price did not return a fresh id (old=%d base=%d opt=%d)\n",
+               id_base, new_id_base, new_id_opt);
+        fails++;
+    }
+    if (order_live_at(&ob_base, 1, 0, id_base, 5) || order_live_at(&ob_opt, 1, 0, id_opt, 5)) {
+        printf("FAIL: modify_price left the old order still resting at its old level\n");
+        fails++;
+    }
+    if (!order_live_at(&ob_base, 1, 2, new_id_base, 12) || !order_live_at(&ob_opt, 1, 2, new_id_opt, 12)) {
+        printf("FAIL: modify_price did not place the new order at the new level\n");
+        fails++;
+    }
+    long expect_move_cash_delta = (long)5 * ob_base.bids[0].price - (long)12 * ob_base.bids[2].price;
+    if (acc_base.my_cash != cash_before_move_base + expect_move_cash_delta ||
+        acc_opt.my_cash  != cash_before_move_opt  + expect_move_cash_delta) {
+        printf("FAIL: modify_price's net cash effect (refund old, reserve new) was wrong\n");
+        fails++;
+    }
+
+    // --- modify_price rejected (invalid level): old order must be untouched ---
+    long cash_before_bad_move_base = acc_base.my_cash, cash_before_bad_move_opt = acc_opt.my_cash;
+    int bad_base = ob_modify_price_baseline(&ob_base, &acc_base, new_id_base, MAX_PRICE_LEVELS, 12);
+    int bad_opt  = ob_modify_price_opt(&ob_opt, &acc_opt, new_id_opt, MAX_PRICE_LEVELS, 12);
+    if (bad_base != -1 || bad_opt != -1 ||
+        acc_base.my_cash != cash_before_bad_move_base || acc_opt.my_cash != cash_before_bad_move_opt ||
+        !order_live_at(&ob_base, 1, 2, new_id_base, 12) || !order_live_at(&ob_opt, 1, 2, new_id_opt, 12)) {
+        printf("FAIL: rejected modify_price mutated state or lost the original order\n");
+        fails++;
+    }
+
+    for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
+        ob_clean_ghosts_baseline(&ob_base.bids[i]);
+        ob_clean_ghosts_opt(&ob_opt.bids[i]);
+        ob_clean_ghosts_baseline(&ob_base.asks[i]);
+        ob_clean_ghosts_opt(&ob_opt.asks[i]);
+    }
+    ob_update_total_qty_baseline(&ob_base);
+    if (!accounts_equal(&acc_base, &acc_opt) || !books_equal(&ob_base, &ob_opt)) {
+        printf("FAIL: baseline/opt diverged after the cancel-replace sequence\n");
+        fails++;
+    }
+
+    if (fails == 0) {
+        printf("PASS: cancel-replace lifecycle (qty increase/decrease/rejected-increase, "
+               "price move with fresh id, rejected move leaving the original untouched) "
+               "identical on baseline and opt\n");
+    }
+    return fails;
+}
+
+// Randomized run mixing modify_qty/modify_price into the same style of
+// workload as test_random_stress, diffing full state after every op.
+static int test_modify_random_stress(void) {
+    L3OrderBook ob_base, ob_opt;
+    EngineAccount acc_base, acc_opt;
+    ob_init_baseline(&ob_base, &acc_base, 100);
+    ob_init_opt(&ob_opt, &acc_opt, 100);
+
+    rng_state = 0x5CA1ABu; // fixed seed, independent stream from the other stress tests
+    int fails = 0;
+
+    #define MAX_ISSUED 4096
+    int issued_ids[MAX_ISSUED];
+    int issued_count = 0;
+
+    const int ITERATIONS = 50000;
+    for (int i = 0; i < ITERATIONS && fails == 0; i++) {
+        int action = rand_range(0, 99);
+        int level = rand_range(0, MAX_PRICE_LEVELS - 1);
+        int qty = rand_range(1, 25);
+
+        if (action < 25) {
+            int is_player = rand_range(0, 3) == 0;
+            if (rand_range(0, 1)) {
+                ob_market_buy_baseline(&ob_base, &acc_base, qty, is_player);
+                ob_market_buy_opt(&ob_opt, &acc_opt, qty, is_player);
+            } else {
+                ob_market_sell_baseline(&ob_base, &acc_base, qty, is_player);
+                ob_market_sell_opt(&ob_opt, &acc_opt, qty, is_player);
+            }
+        } else if (action < 55) {
+            int id_base, id_opt;
+            if (rand_range(0, 1)) {
+                id_base = ob_place_limit_buy_baseline(&ob_base, &acc_base, level, qty);
+                id_opt  = ob_place_limit_buy_opt(&ob_opt, &acc_opt, level, qty);
+            } else {
+                id_base = ob_place_limit_sell_baseline(&ob_base, &acc_base, level, qty);
+                id_opt  = ob_place_limit_sell_opt(&ob_opt, &acc_opt, level, qty);
+            }
+            if (id_base != id_opt) {
+                printf("FAIL at iter %d: placement id diverged (base=%d opt=%d)\n", i, id_base, id_opt);
+                fails++;
+            }
+            if (id_base >= 0 && issued_count < MAX_ISSUED) issued_ids[issued_count++] = id_base;
+        } else if (action < 70 && issued_count > 0) {
+            int id = issued_ids[rand_range(0, issued_count - 1)];
+            int r_base = ob_cancel_order_baseline(&ob_base, &acc_base, id);
+            int r_opt  = ob_cancel_order_opt(&ob_opt, &acc_opt, id);
+            if (r_base != r_opt) {
+                printf("FAIL at iter %d: cancel(%d) result diverged (base=%d opt=%d)\n", i, id, r_base, r_opt);
+                fails++;
+            }
+        } else if (action < 85 && issued_count > 0) {
+            // modify_qty on a previously-issued id — may already be gone,
+            // that path (rejection) is exercised on purpose, not skipped.
+            int id = issued_ids[rand_range(0, issued_count - 1)];
+            int new_qty = rand_range(1, 40);
+            int r_base = ob_modify_qty_baseline(&ob_base, &acc_base, id, new_qty);
+            int r_opt  = ob_modify_qty_opt(&ob_opt, &acc_opt, id, new_qty);
+            if (r_base != r_opt) {
+                printf("FAIL at iter %d: modify_qty(%d,%d) result diverged (base=%d opt=%d)\n",
+                       i, id, new_qty, r_base, r_opt);
+                fails++;
+            }
+        } else if (issued_count > 0) {
+            // modify_price on a previously-issued id — new id (if accepted)
+            // gets tracked too, so it can itself be modified/cancelled later.
+            int id = issued_ids[rand_range(0, issued_count - 1)];
+            int new_level = rand_range(0, MAX_PRICE_LEVELS - 1);
+            int new_qty = rand_range(1, 25);
+            int new_id_base = ob_modify_price_baseline(&ob_base, &acc_base, id, new_level, new_qty);
+            int new_id_opt  = ob_modify_price_opt(&ob_opt, &acc_opt, id, new_level, new_qty);
+            if (new_id_base != new_id_opt) {
+                printf("FAIL at iter %d: modify_price(%d) result diverged (base=%d opt=%d)\n",
+                       i, id, new_id_base, new_id_opt);
+                fails++;
+            }
+            if (new_id_base >= 0 && issued_count < MAX_ISSUED) issued_ids[issued_count++] = new_id_base;
+        } else {
+            int bogus_id = rand_range(2000000, 3000000);
+            int r_base = ob_modify_qty_baseline(&ob_base, &acc_base, bogus_id, qty);
+            int r_opt  = ob_modify_qty_opt(&ob_opt, &acc_opt, bogus_id, qty);
+            if (r_base || r_opt) {
+                printf("FAIL at iter %d: modify_qty of a bogus id was accepted (base=%d opt=%d)\n",
+                       i, r_base, r_opt);
+                fails++;
+            }
+        }
+
+        for (int lvl = 0; lvl < MAX_PRICE_LEVELS; lvl++) {
+            ob_clean_ghosts_baseline(&ob_base.bids[lvl]);
+            ob_clean_ghosts_opt(&ob_opt.bids[lvl]);
+            ob_clean_ghosts_baseline(&ob_base.asks[lvl]);
+            ob_clean_ghosts_opt(&ob_opt.asks[lvl]);
+        }
+        ob_update_total_qty_baseline(&ob_base);
+
+        if (!accounts_equal(&acc_base, &acc_opt)) {
+            printf("FAIL at iter %d: account state diverged (base cash=%ld inv=%d, "
+                   "opt cash=%ld inv=%d)\n", i, acc_base.my_cash, acc_base.my_inventory,
+                   acc_opt.my_cash, acc_opt.my_inventory);
+            fails++;
+        }
+        if (!books_equal(&ob_base, &ob_opt)) {
+            printf("FAIL at iter %d: book state diverged\n", i);
+            fails++;
+        }
+    }
+    #undef MAX_ISSUED
+
+    if (fails == 0) {
+        printf("PASS: %d randomized operations (market/limit/cancel/modify_qty/modify_price, "
+               "mixed valid and invalid), baseline and opt stayed identical after every single "
+               "operation (%d order ids issued)\n", ITERATIONS, issued_count);
+    }
+    return fails;
+}
+
+// Indexed modify functions vs the plain (whole-book-scan) ones — same
+// equivalence-under-randomization shape as test_indexed_cancel_equivalence.
+static int test_indexed_modify_equivalence(void) {
+    L3OrderBook ob_a, ob_b; // ob_a: plain ob_modify_*_opt; ob_b: indexed
+    EngineAccount acc_a, acc_b;
+    static OrderIndex idx;
+    ob_init_opt(&ob_a, &acc_a, 100);
+    ob_init_opt(&ob_b, &acc_b, 100);
+    ob_index_init(&idx);
+
+    rng_state = 0xBADA55u;
+    int fails = 0;
+
+    #define MAX_ISSUED 4096
+    int issued_ids[MAX_ISSUED];
+    int issued_count = 0;
+
+    const int ITERATIONS = 50000;
+    for (int i = 0; i < ITERATIONS && fails == 0; i++) {
+        int action = rand_range(0, 99);
+        int level = rand_range(0, MAX_PRICE_LEVELS - 1);
+        int qty = rand_range(1, 25);
+
+        if (action < 25) {
+            int is_player = rand_range(0, 3) == 0;
+            if (rand_range(0, 1)) {
+                ob_market_buy_opt(&ob_a, &acc_a, qty, is_player);
+                ob_market_buy_opt(&ob_b, &acc_b, qty, is_player);
+            } else {
+                ob_market_sell_opt(&ob_a, &acc_a, qty, is_player);
+                ob_market_sell_opt(&ob_b, &acc_b, qty, is_player);
+            }
+        } else if (action < 55) {
+            int id_a, id_b;
+            if (rand_range(0, 1)) {
+                id_a = ob_place_limit_buy_opt(&ob_a, &acc_a, level, qty);
+                id_b = ob_place_limit_buy_opt_indexed(&ob_b, &acc_b, &idx, level, qty);
+            } else {
+                id_a = ob_place_limit_sell_opt(&ob_a, &acc_a, level, qty);
+                id_b = ob_place_limit_sell_opt_indexed(&ob_b, &acc_b, &idx, level, qty);
+            }
+            if (id_a != id_b) {
+                printf("FAIL at iter %d: placement id diverged (plain=%d indexed=%d)\n", i, id_a, id_b);
+                fails++;
+            }
+            if (id_a >= 0 && issued_count < MAX_ISSUED) issued_ids[issued_count++] = id_a;
+        } else if (action < 70 && issued_count > 0) {
+            int id = issued_ids[rand_range(0, issued_count - 1)];
+            int r_a = ob_cancel_order_opt(&ob_a, &acc_a, id);
+            int r_b = ob_cancel_order_opt_indexed(&ob_b, &acc_b, &idx, id);
+            if (r_a != r_b) {
+                printf("FAIL at iter %d: cancel(%d) result diverged (plain=%d indexed=%d)\n", i, id, r_a, r_b);
+                fails++;
+            }
+        } else if (action < 85 && issued_count > 0) {
+            int id = issued_ids[rand_range(0, issued_count - 1)];
+            int new_qty = rand_range(1, 40);
+            int r_a = ob_modify_qty_opt(&ob_a, &acc_a, id, new_qty);
+            int r_b = ob_modify_qty_opt_indexed(&ob_b, &acc_b, &idx, id, new_qty);
+            if (r_a != r_b) {
+                printf("FAIL at iter %d: modify_qty(%d,%d) result diverged (plain=%d indexed=%d)\n",
+                       i, id, new_qty, r_a, r_b);
+                fails++;
+            }
+        } else if (issued_count > 0) {
+            int id = issued_ids[rand_range(0, issued_count - 1)];
+            int new_level = rand_range(0, MAX_PRICE_LEVELS - 1);
+            int new_qty = rand_range(1, 25);
+            int new_id_a = ob_modify_price_opt(&ob_a, &acc_a, id, new_level, new_qty);
+            int new_id_b = ob_modify_price_opt_indexed(&ob_b, &acc_b, &idx, id, new_level, new_qty);
+            if (new_id_a != new_id_b) {
+                printf("FAIL at iter %d: modify_price(%d) result diverged (plain=%d indexed=%d)\n",
+                       i, id, new_id_a, new_id_b);
+                fails++;
+            }
+            if (new_id_a >= 0 && issued_count < MAX_ISSUED) issued_ids[issued_count++] = new_id_a;
+        } else {
+            int bogus_id = rand_range(2000000, 3000000);
+            int r_a = ob_modify_qty_opt(&ob_a, &acc_a, bogus_id, qty);
+            int r_b = ob_modify_qty_opt_indexed(&ob_b, &acc_b, &idx, bogus_id, qty);
+            if (r_a || r_b) {
+                printf("FAIL at iter %d: modify_qty of a bogus id was accepted (plain=%d indexed=%d)\n",
+                       i, r_a, r_b);
+                fails++;
+            }
+        }
+
+        for (int lvl = 0; lvl < MAX_PRICE_LEVELS; lvl++) {
+            ob_clean_ghosts_opt(&ob_a.bids[lvl]);
+            ob_clean_ghosts_opt(&ob_b.bids[lvl]);
+            ob_clean_ghosts_opt(&ob_a.asks[lvl]);
+            ob_clean_ghosts_opt(&ob_b.asks[lvl]);
+        }
+
+        if (!accounts_equal(&acc_a, &acc_b)) {
+            printf("FAIL at iter %d: account state diverged between plain and indexed modify\n", i);
+            fails++;
+        }
+        if (!books_equal(&ob_a, &ob_b)) {
+            printf("FAIL at iter %d: book state diverged between plain and indexed modify\n", i);
+            fails++;
+        }
+    }
+    #undef MAX_ISSUED
+
+    if (fails == 0) {
+        printf("PASS: %d randomized operations, indexed modify_qty/modify_price produced "
+               "identical account+book state to the plain (whole-book-scan) versions at "
+               "every step (%d order ids issued)\n", ITERATIONS, issued_count);
+    }
+    return fails;
+}
+
+static int test_modify_order(void) {
+    int failures = 0;
+    failures += test_modify_order_lifecycle();
+    failures += test_modify_random_stress();
+    failures += test_indexed_modify_equivalence();
+    return failures;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_tick_replay();
@@ -839,6 +1225,7 @@ int main(void) {
     failures += test_risk_limit_clipping();
     failures += test_risk_limit_end_to_end();
     failures += test_indexed_cancel();
+    failures += test_modify_order();
 
     if (failures == 0) {
         printf("\nALL TESTS PASSED\n");

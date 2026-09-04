@@ -155,6 +155,62 @@ int ob_cancel_order_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id);
 int ob_cancel_order_opt     (L3OrderBook *ob, EngineAccount *acc, int order_id);
 
 // ----------------------------------------------------------------------
+// Cancel-replace (order modification), split into the two cases real
+// venues actually treat differently — this isn't one function because
+// the underlying behavior genuinely isn't one thing:
+//
+//   - A pure quantity change never has to move the order in the queue —
+//     nothing about *where* it sits changed, so ob_modify_qty_* mutates
+//     it in place and the order KEEPS its id and its queue position
+//     (i.e. keeps whatever time priority it already had).
+//   - A price/level change is different: at a real venue, moving an
+//     order to a different price essentially always forfeits queue
+//     priority (it's now competing at a level it wasn't resting at
+//     before). ob_modify_price_* models that honestly instead of
+//     pretending otherwise — it's cancel-old + place-new under the hood,
+//     the new order gets a NEW id, and it goes to the back of the new
+//     level's queue like any other placement. Calling it at the *same*
+//     level the order is already resting at is a legal way to change qty
+//     while deliberately giving up priority (goes to the back of that
+//     same queue) — the difference from ob_modify_qty_* is exactly that
+//     priority trade-off, not a quirk.
+//
+// Both reuse the already-tested ob_place_limit_*/ob_cancel_order_*
+// functions rather than reimplementing reservation logic a third time.
+// ----------------------------------------------------------------------
+
+// Changes a resting is_mine order's quantity without moving it — same id,
+// same (level, slot), same queue position. Increasing qty reserves the
+// additional cash (buy) or inventory (sell); decreasing refunds the
+// difference. Returns 1 on success, 0 if order_id isn't a live order of
+// ours, new_qty <= 0, or an increase can't be covered — nothing is
+// mutated on rejection, same discipline as every placement function here.
+int ob_modify_qty_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id, int new_qty);
+int ob_modify_qty_opt     (L3OrderBook *ob, EngineAccount *acc, int order_id, int new_qty);
+
+// Moves a resting is_mine order to a different level/qty — cancel-old +
+// place-new, deliberately in that order reversed: place-new is tried
+// FIRST, and the old order is only cancelled if that succeeds. If the new
+// placement is rejected (bad level, qty <= 0, insufficient cash/inventory,
+// full queue), the original order is left completely untouched rather
+// than risking ending up with neither the old order nor a new one.
+//
+// Trade-off stated plainly: for a moment both the old and the new
+// order's reservations are held at once (the old one isn't refunded
+// until after the new one is confirmed placed), so this can reject a
+// move that a venue netting collateral in real time would have allowed.
+// Netting it instead would mean modifying ob_place_limit_*_opt itself
+// (breaking the "wrapper, not a modification" rule the risk-limit and
+// indexed-cancel features above already committed to) or reimplementing
+// reservation logic a third time — not worth it without evidence this
+// ever actually blocks a legitimate move at this book's scale.
+//
+// Returns the NEW order's id (>=0) on success, or -1 on rejection (old
+// order still live, nothing changed).
+int ob_modify_price_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id, int new_level, int new_qty);
+int ob_modify_price_opt     (L3OrderBook *ob, EngineAccount *acc, int order_id, int new_level, int new_qty);
+
+// ----------------------------------------------------------------------
 // Pre-trade risk limit for the player's own market orders.
 //
 // main.c's player_market_buy/player_market_sell have no position check
@@ -266,5 +322,15 @@ int ob_place_limit_sell_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIn
 // Same return contract as ob_cancel_order_opt: 1 if found and cancelled,
 // 0 if not (already gone, or never existed).
 int ob_cancel_order_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int order_id);
+
+// O(1) counterparts to ob_modify_qty_opt/ob_modify_price_opt, using the
+// index instead of a whole-book scan to find the order. Same semantics
+// and same return contracts as their non-indexed counterparts above.
+// ob_modify_qty_opt_indexed doesn't need to touch `idx` at all beyond the
+// lookup (the order's (level, slot) never changes); ob_modify_price_opt_indexed
+// re-registers the new order and removes the old one, same as calling
+// ob_place_limit_*_opt_indexed + ob_cancel_order_opt_indexed separately.
+int ob_modify_qty_opt_indexed  (L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int order_id, int new_qty);
+int ob_modify_price_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int order_id, int new_level, int new_qty);
 
 #endif // ORDERBOOK_ENGINE_H
