@@ -151,7 +151,7 @@
     <div class="stat"><div class="v num">34</div><div class="l">个公开函数</div></div>
     <div class="stat"><div class="v num">9</div><div class="l">组测试，含 4 个 5 万次随机压测</div></div>
     <div class="stat"><div class="v num">47.4×</div><div class="l">索引查找 vs 线性扫描（深度 400）</div></div>
-    <div class="stat"><div class="v num">-168,805</div><div class="l">无风控时库存能跑多偏（已修复）</div></div>
+    <div class="stat"><div class="v num">4</div><div class="l">个函数记账方向反了，baseline/opt 一致地错（已修复）</div></div>
   </div>
 
   <!-- ================= LIFECYCLE DIAGRAM ================= -->
@@ -263,7 +263,7 @@
   <!-- ================= RISK ================= -->
   <section>
     <div class="sec-head"><span class="sec-no">05</span><h2>风控</h2></div>
-    <p class="sec-desc">main.c 的市价单完全没有仓位上限——随机压测直接把库存打到 -168,805，暴露出这个洞之后才补上的。</p>
+    <p class="sec-desc">main.c 的市价单完全没有仓位上限——随机压测把库存打得远远超出合理范围，暴露出这个洞之后才补上的（当时报出来的具体数字后来发现一部分是另一个记账方向 bug 造成的，见下方"O(1) 索引"之后那一节，但"没有仓位上限"这个结论本身没变）。</p>
     <div class="cap">
       <div class="fnlist">
         <div class="fnrow"><span class="tag both"></span><div><div class="sig"><span class="fn">ob_market_buy_risk_checked_*</span> / <span class="fn">ob_market_sell_risk_checked_*</span></div><div class="note">套在市价单外面的一层，把请求数量削减到 <code>MAX_POSITION</code>（500）以内——削减、不是直接拒绝，0 笔成交也是合法结果</div></div></div>
@@ -340,9 +340,19 @@
     </div>
   </section>
 
+  <!-- ================= FILL-DIRECTION BUG ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-no">07</span><h2>一个记账方向的 bug</h2></div>
+    <p class="sec-desc"><code>ob_market_buy_opt</code>/<code>sell_opt</code>（还有 baseline）把两种不同的成交，当成同一种方向来记账：<b>玩家自己主动下单成交</b>（方向对）和<b>别人的单子吃掉了我挂在盘口的单子</b>（方向应该相反，之前写反了）。这两个引擎自己的测试从来没抓到过——因为 baseline 和 opt 犯的是<b>一模一样的错</b>，"两边对得上"这件事本身骗过了所有测试。真正抓到它的，是 Market-Maker-Strategy 那边一个全新的库存风控测试。</p>
+    <div class="cap">
+      <div class="finding"><b>"测试全绿" ≠ "代码是对的"</b>——这是这个项目讲得最透的一课，比之前那个数组越界的 bug 更彻底：那个后来被 ASan 自己抓到了；这个只能靠"检查经济逻辑对不对"的外部测试才能发现，光靠内部一致性永远抓不到。</div>
+      <div class="finding">修复方式：两个方向共用同一套公式，加一个 <code>sign = is_player ? 1 : -1</code>——玩家自己下单那条路径（<code>sign=1</code>）完全不变，被噪音单吃掉自己挂单那条路径（<code>sign=-1</code>）方向翻正。baseline/opt 同步改，改完重新跑一遍全部测试，两边依然完全一致——只是现在算出来的具体数字是对的。</div>
+    </div>
+  </section>
+
   <!-- ================= CONCURRENCY ================= -->
   <section>
-    <div class="sec-head"><span class="sec-no">07</span><h2>并发基础设施</h2></div>
+    <div class="sec-head"><span class="sec-no">08</span><h2>并发基础设施</h2></div>
     <p class="sec-desc">撮合本身永远单线程（一本账必须按顺序处理）。能并行的是"收单子"和"真正撮合"这两件事。</p>
     <div class="cap">
       <figure>
@@ -433,7 +443,7 @@
 
   <!-- ================= VERIFICATION ================= -->
   <section>
-    <div class="sec-head"><span class="sec-no">08</span><h2>验证与工具</h2></div>
+    <div class="sec-head"><span class="sec-no">09</span><h2>验证与工具</h2></div>
     <p class="sec-desc">这个项目的核心纪律：先证明"一样"，才谈"更快"。</p>
     <div class="cap">
       <div class="fnlist">

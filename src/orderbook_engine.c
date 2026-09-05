@@ -53,9 +53,24 @@ void ob_market_buy_baseline(L3OrderBook *ob, EngineAccount *acc, int qty, int is
             ord->qty -= fill;
             qty -= fill;
 
+            // is_player: the player's own aggressive buy (self-trade already
+            // excluded above, so this only ever hits a non-mine ask here) -
+            // inventory up, cash down, the ordinary "I bought" direction.
+            // !is_player && ord->is_mine: noise flow filled OUR resting ask
+            // instead - WE are the seller in that trade, so the direction
+            // must flip (inventory down, cash up), not repeat the buy
+            // direction. This is the fix for a real bug: both branches used
+            // to apply the same sign, which was only ever exercised (and
+            // only ever correct) for the is_player=1 case, since main.c
+            // never had a way to set is_mine=1 on a resting order at all -
+            // the moment the extracted engine's limit-order lifecycle made
+            // that reachable, this became a silent direction error that
+            // baseline and opt shared identically, so their mutual
+            // equivalence tests could never have caught it (see README).
             if (is_player || ord->is_mine) {
-                acc->my_inventory += fill;
-                acc->my_cash -= (long)fill * ob->asks[i].price;
+                int sign = is_player ? 1 : -1;
+                acc->my_inventory += sign * fill;
+                acc->my_cash -= sign * (long)fill * ob->asks[i].price;
                 acc->total_fill_volume += fill;
                 acc->window_trade_qty += fill;
             }
@@ -81,9 +96,14 @@ void ob_market_sell_baseline(L3OrderBook *ob, EngineAccount *acc, int qty, int i
             ord->qty -= fill;
             qty -= fill;
 
+            // Mirror of ob_market_buy_baseline's fix above: is_player's own
+            // sell keeps the original direction (inventory down, cash up);
+            // noise flow filling OUR resting bid means WE are the buyer in
+            // that trade, so it must flip (inventory up, cash down).
             if (is_player || ord->is_mine) {
-                acc->my_inventory -= fill;
-                acc->my_cash += (long)fill * ob->bids[i].price;
+                int sign = is_player ? 1 : -1;
+                acc->my_inventory -= sign * fill;
+                acc->my_cash += sign * (long)fill * ob->bids[i].price;
                 acc->total_fill_volume += fill;
                 acc->window_trade_qty += fill;
             }
@@ -210,9 +230,12 @@ void ob_market_buy_opt(L3OrderBook *ob, EngineAccount *acc, int qty, int is_play
             qty -= fill;
             filled_here += fill;
 
+            // See ob_market_buy_baseline for why this needs a sign flip
+            // between the two cases now, not the same direction for both.
             if (is_player || ord->is_mine) {
-                acc->my_inventory += fill;
-                acc->my_cash -= (long)fill * lvl->price;
+                int sign = is_player ? 1 : -1;
+                acc->my_inventory += sign * fill;
+                acc->my_cash -= sign * (long)fill * lvl->price;
                 acc->total_fill_volume += fill;
                 acc->window_trade_qty += fill;
             }
@@ -242,9 +265,11 @@ void ob_market_sell_opt(L3OrderBook *ob, EngineAccount *acc, int qty, int is_pla
             qty -= fill;
             filled_here += fill;
 
+            // See ob_market_sell_baseline for why this needs a sign flip.
             if (is_player || ord->is_mine) {
-                acc->my_inventory -= fill;
-                acc->my_cash += (long)fill * lvl->price;
+                int sign = is_player ? 1 : -1;
+                acc->my_inventory -= sign * fill;
+                acc->my_cash += sign * (long)fill * lvl->price;
                 acc->total_fill_volume += fill;
                 acc->window_trade_qty += fill;
             }

@@ -209,6 +209,21 @@ ported engine stops that; it's not a bug (the original game never claimed
 to have risk controls), but it's exactly the kind of gap a real venue
 would never ship with.
 
+**Correction, added later:** re-running this exact test today gives a
+final inventory near zero, not -168,805. That number wasn't purely
+measuring "no risk limit" — part of what drove it that far was the fill-
+direction bug documented in "A fill-direction bug..." below, which this
+same stress test was *also* incidentally triggering (noise flow filling
+this test's resting `is_mine` orders in the wrong direction, compounding
+in the same direction as the unconstrained `is_player=1` selling). Fixing
+that bug doesn't undo the underlying finding here — raw
+`ob_market_buy_opt`/`ob_market_sell_opt` genuinely have no position floor,
+by construction, independent of any bug — but it does mean this specific
+number was measuring two things at once, not one. The clean, still-valid
+proof that the risk limit actually works is `test_risk_limit_end_to_end`,
+which asserts the bound holds under real matching, not an incidental
+large number from an unrelated stress test.
+
 Added `ob_market_buy_risk_checked_*` / `ob_market_sell_risk_checked_*` —
 thin wrappers around the existing, *unmodified* `ob_market_buy_opt` /
 `ob_market_sell_baseline` etc. — that clip the requested qty down to
@@ -548,6 +563,58 @@ it in isolation — the point being to prove drift composes safely with
 every other operation this file already exercises, not just that it works
 on its own. Clean under `make asan`.
 
+## A fill-direction bug — found by a downstream project's test, not this repo's own
+
+`ob_market_buy_opt`/`ob_market_sell_opt` (and their `_baseline` twins)
+update `my_inventory`/`my_cash` whenever `is_player || ord->is_mine` is
+true — one condition meant to cover two genuinely different trades:
+
+1. **The player's own aggressive fill** (`is_player=1`; self-trade
+   exclusion already guarantees this never hits an `is_mine` order). A
+   market buy here means the player bought: inventory up, cash down.
+2. **Noise flow filling the player's own *resting* order**
+   (`is_player=0`, `ord->is_mine=1`) — only reachable at all once the
+   limit-order lifecycle existed, since `main.c` never set `is_mine=1`
+   anywhere. If the resting order noise flow just filled was an **ask**,
+   the player was the *seller* in that trade: inventory should go
+   *down*, cash *up* — the opposite of case 1.
+
+The code applied case 1's direction to both. Every baseline-vs-opt
+equivalence test in this file kept passing the entire time, because
+baseline and opt carried the identical error — those tests only ever
+checked "do these two implementations agree with each other," which they
+did, faithfully, on a shared mistake. What actually exposed it: a
+*different* project (Market-Maker-Strategy, which vendors this engine as
+a submodule) added a randomized test asserting `|inventory| <=
+position_limit` under real noise-flow fills, and that test failed — not
+because its own logic was wrong, but because the engine underneath it was
+quietly crediting every one of its resting-order fills in the wrong
+direction, which no test *inside this repo* was positioned to catch,
+since none of them checked economic correctness, only mutual agreement.
+
+**Fix:** both directions now compute `sign = is_player ? 1 : -1` and
+apply it to the *existing* case-1 formula, so the well-tested
+`is_player=1` path is untouched (same code, sign=1, zero behavioral
+change) and the previously-backwards `is_player=0 && is_mine` path
+flips to the correct direction. Applied identically to baseline and opt.
+
+**What changed, honestly:** this does NOT affect the pre-trade risk-limit
+wrappers (`ob_market_*_risk_checked_*`) — those only ever call the
+matching functions with `is_player=1`, the path that was always correct.
+It DOES change the final numbers `test_random_stress` and similar
+randomized tests print (see the correction note in "A gap the stress test
+exposed" above) — those tests mix noise flow with resting `is_mine`
+orders, exactly the path this bug lived on. All of them still pass
+(baseline and opt still agree, exactly as before — the fix is symmetric),
+just with different, now-correct, absolute numbers.
+
+Verified with the existing test suite re-run after the fix (`make test`,
+`make asan`) — no new tests were needed specifically for this, since the
+existing baseline-vs-opt randomized stress tests already exercise the
+exact code path that changed; what mattered was confirming they still
+pass identically after the fix, not adding new coverage for a fix to
+code that was already being exercised.
+
 ## Capability map
 
 `tools/capability_map.html` — a static, no-build-step reference page for
@@ -726,16 +793,21 @@ A useful narrative arc, in order:
 7. **What the stress test found beyond baseline-vs-opt agreement**: the
    same 100k-iteration randomized test built to verify the optimization
    also, incidentally, revealed that unconstrained player selling drives
-   `my_inventory` to -168,805 with nothing stopping it — because that's
-   just what `main.c`'s logic does, faithfully ported. Adding a pre-trade
-   position limit as a *wrapper* around the existing matching functions
-   (not a modification to them) is a small, deliberate design choice worth
-   explaining on its own: it keeps "baseline" meaning "an unmodified,
-   verifiable port of the original," while still being able to demonstrate
-   risk-control thinking — the layer a real venue would never ship
-   without — on top of it. Being able to say why you *didn't* just add an
-   `if` statement inside the existing function is as much the signal as
-   the risk check itself.
+   `my_inventory` arbitrarily negative with nothing stopping it — because
+   that's just what `main.c`'s logic does, faithfully ported (the exact
+   number quoted for this at the time, -168,805, later turned out to be
+   partly a different bug — see point 9 — worth mentioning in an interview
+   as its own lesson: "the specific number I quoted changed after a later
+   fix, here's why, and here's why the underlying finding still held"
+   is a stronger answer than defending a stale number would have been).
+   Adding a pre-trade position limit as a *wrapper* around the existing
+   matching functions (not a modification to them) is a small, deliberate
+   design choice worth explaining on its own: it keeps "baseline" meaning
+   "an unmodified, verifiable port of the original," while still being
+   able to demonstrate risk-control thinking — the layer a real venue
+   would never ship without — on top of it. Being able to say why you
+   *didn't* just add an `if` statement inside the existing function is as
+   much the signal as the risk check itself.
 
 8. **What you did once "it's cheap, don't bother indexing" stopped being
    true**: the original cancel was an honest, stated tradeoff — O(orders)
@@ -751,6 +823,27 @@ A useful narrative arc, in order:
    of requiring the index to stay perfectly in sync with a compaction
    routine it can't safely be wired into, is a concrete answer to "design
    me an order book" that most candidates only gesture at abstractly.
+
+9. **What a downstream project's test found that this repo's own tests
+   couldn't**: `ob_market_buy_opt`/`sell_opt` (and their baseline twins)
+   applied the *same* accounting sign to two cases that need opposite
+   signs — the player's own aggressive fill, and noise flow filling the
+   player's own resting order (which only became reachable once the
+   limit-order lifecycle existed). Baseline and opt shared the identical
+   error, so every baseline-vs-opt equivalence test in this file kept
+   passing throughout — they were only ever checking "do these two
+   implementations agree with each other," not "is either of them
+   economically correct." What actually surfaced it: a *new* test in the
+   separate Market-Maker-Strategy project (a randomized position-limit
+   check under real noise-flow fills — see that repo) failed in a way an
+   internally-consistent-but-wrong engine has no way to catch on its own.
+   The fix and the discovery story are both in "A fill-direction bug..."
+   below. This is worth leading with as the single clearest illustration
+   in this whole project of "green tests mean the paths you exercised
+   agree with each other, not that they're right" — more so than the
+   buffer-overflow bug above, because that one *did* get caught by a
+   sanitizer eventually; this one could only ever have been caught by
+   something checking real-world correctness, not internal consistency.
 
 This is a much stronger story than "I built a project" — it demonstrates
 the actual discipline (verify before trusting, measure before claiming,
