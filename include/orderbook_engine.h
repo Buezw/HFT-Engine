@@ -211,6 +211,47 @@ int ob_modify_price_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id, 
 int ob_modify_price_opt     (L3OrderBook *ob, EngineAccount *acc, int order_id, int new_level, int new_qty);
 
 // ----------------------------------------------------------------------
+// Price drift — not present in main.c or anywhere else in this engine
+// until now: every price level is set once in ob_init_* and NEVER moves
+// again on its own. That's fine for testing the matching/lifecycle logic
+// in isolation, but it means a market maker built on this engine has no
+// fair-value risk to actually manage — inventory can never lose money to
+// "the market moved against you," because the market structurally can't
+// move (see engine README's "Trace visualizer" section, where this was
+// first noticed, and the Market-Maker-Strategy repo's README, which
+// states outright that its inventory skew has no adverse-selection risk
+// to defend against as a result).
+//
+// ob_drift_price_* shifts every level's price by `delta` (bids and asks
+// together, same shift, so the spread and level spacing ob_init_*
+// established never change — only where the whole ladder sits). This is
+// a primitive, not a policy: it doesn't decide *when* or *how much* to
+// drift — something external (a test, a trace scenario, eventually the
+// strategy's own market-simulation harness) calls it, the same way
+// nothing inside this engine ever decides when a market order arrives.
+//
+// Honest limitation, not glossed over: this engine has exactly
+// MAX_PRICE_LEVELS fixed slots per side, unlike a real order book where
+// price levels are created and destroyed as orders arrive at whatever
+// price they name. Drifting is therefore a relabeling of what those
+// fixed slots' price tags are, not a simulation of new levels appearing —
+// which means an order resting in a level when it drifts gets, in effect,
+// repriced along with the level: ob_market_buy_opt/sell_opt charge
+// (long)fill * lvl->price using whatever the level's CURRENT price is at
+// fill time, not whatever price was in effect when the order was placed.
+// A faithful multi-level book wouldn't do this; this one does, as a
+// direct consequence of the fixed-slot model everything else here is
+// already built on, not a bug introduced by this feature specifically.
+//
+// Returns 1 if applied, 0 if it would push any bid level below MIN_PRICE
+// (1) — rejected outright (nothing mutated), not silently clamped, so a
+// caller running a repeated random walk can just skip that step instead
+// of the walk silently getting stuck at a floor.
+#define MIN_PRICE 1
+int ob_drift_price_baseline(L3OrderBook *ob, int delta);
+int ob_drift_price_opt     (L3OrderBook *ob, int delta);
+
+// ----------------------------------------------------------------------
 // Pre-trade risk limit for the player's own market orders.
 //
 // main.c's player_market_buy/player_market_sell have no position check

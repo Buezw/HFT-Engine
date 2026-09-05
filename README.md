@@ -54,10 +54,11 @@ Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep
     (see below), a pre-trade position risk limit
     (`ob_market_*_risk_checked_*`), an O(1) cancel-by-id index
     (`OrderIndex`, `ob_place_limit_*_opt_indexed`,
-    `ob_cancel_order_opt_indexed`), and cancel-replace order modification
-    (`ob_modify_qty_*`, `ob_modify_price_*`, `+_opt_indexed`) — all new in
-    the extracted engine, not ports of anything in `main.c`.
-- `tests/test_correctness.c` — eight things, in order: (1) replays 200,000
+    `ob_cancel_order_opt_indexed`), cancel-replace order modification
+    (`ob_modify_qty_*`, `ob_modify_price_*`, `+_opt_indexed`), and price
+    drift (`ob_drift_price_*`) — all new in the extracted engine, not
+    ports of anything in `main.c`.
+- `tests/test_correctness.c` — nine things, in order: (1) replays 200,000
   ticks of synthetic market-maker + player activity against both engines
   and asserts identical account state and book state after every tick —
   this has to pass before any benchmark number means anything; (2) a
@@ -76,7 +77,10 @@ Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep
   deterministic lifecycle, a 50,000-iteration randomized run mixing
   modify_qty/modify_price into the existing workload (baseline vs opt),
   and a second 50,000-iteration run proving the indexed modify variants
-  match the plain whole-book-scan ones.
+  match the plain whole-book-scan ones; (9) price drift's deterministic
+  case (up, down, cumulative, floor rejection) and a 50,000-iteration
+  randomized run folding drift into the full existing market/limit/
+  cancel/modify workload, not testing it in isolation.
 - `bench/benchmark.c` — measures baseline vs optimized under identical
   workload using `clock_gettime(CLOCK_MONOTONIC)`, reporting the mean,
   the p50/p90/p99/p99.9 latency distribution per tick, (via
@@ -478,8 +482,8 @@ over time. `make visualize` fixes that:
 
 - `tools/book_trace.c` runs a fixed, reproducible 300-tick scenario (market
   noise liquidity + noise market orders, player limit placements/cancels via
-  the indexed lifecycle, player risk-checked market orders — the same
-  public API used everywhere else in this project, not a second
+  the indexed lifecycle, player risk-checked market orders, price drift —
+  the same public API used everywhere else in this project, not a second
   implementation of anything) against `*_opt`, and prints one JSON object
   per tick to stdout: every price level, every order (id, qty, `is_mine`,
   ghost state), and account state.
@@ -490,18 +494,59 @@ over time. `make visualize` fixes that:
   (dimmed), and side panel charts track inventory, PnL, and bid/ask depth
   over time.
 
-**A finding this made obvious that wasn't obvious from code alone:** price
-levels are set once in `ob_init_*` and never move again — nothing in this
-engine reprices a level. Watching the replay, only *quantities* move; the
-ladder's price column is frozen for the entire 300 ticks. That's invisible
-reading `ob_market_buy_opt` in isolation (it only ever fills against
-whatever `lvl->price` already is), but it matters a lot for building a
-market maker on top of this engine: there's no fair-value drift, no
-adverse selection, nothing to hedge against, and no notion of "the market
-moved against you" — the primary risk a real market maker manages. Any
-quoting/inventory-skew logic added next either needs its own price-walk
-mechanism, or needs to be honest that it's optimizing spread capture against
-a market that structurally cannot move.
+**A finding this made obvious that wasn't obvious from code alone:** at
+the time this was first built, price levels were set once in `ob_init_*`
+and never moved again — nothing in the engine repriced a level. Watching
+the replay, only *quantities* moved; the ladder's price column sat frozen
+for all 300 ticks. That's invisible reading `ob_market_buy_opt` in
+isolation (it only ever fills against whatever `lvl->price` already is),
+but it mattered a lot for building a market maker on top of this engine:
+there was no fair-value drift, no adverse selection, nothing to hedge
+against, and no notion of "the market moved against you" — the primary
+risk a real market maker manages. **That gap is what motivated
+`ob_drift_price_*`, documented below** — the replay linked above already
+reflects the fix; the ladder now visibly walks instead of sitting still.
+
+## Price drift
+
+The finding above (frozen prices → no adverse-selection risk → inventory
+skew has nothing real to defend against) came from actually watching the
+engine run, and pointed at a real gap: worth fixing in the engine itself,
+since price is a property of the book, not of whatever strategy sits on
+top of it.
+
+`ob_drift_price_baseline` / `ob_drift_price_opt` shift every level's price
+by the same `delta` (bids and asks together, so the spread and level
+spacing `ob_init_*` established never change — only where the whole
+ladder sits). It's a primitive, not a policy: it doesn't decide *when* or
+*how much* to drift — same as nothing in this engine decides when a
+market order arrives. `tools/book_trace.c`'s scenario now calls it every 4
+ticks with a ±1 step, which is enough on its own to visibly walk the mid
+from 101 down to 93 over a 300-tick replay (rerun `make visualize` to see
+the exact path — it's a random walk, not scripted to hit that number).
+
+**Honest limitation, not glossed over:** this engine has exactly
+`MAX_PRICE_LEVELS` fixed slots per side, unlike a real order book where
+levels are created and destroyed as orders arrive at whatever price they
+name. Drifting is therefore a relabeling of what those fixed slots' price
+tags are, not a simulation of new levels appearing — which means an order
+resting in a level when it drifts gets, in effect, repriced along with
+it: `ob_market_buy_opt`/`sell_opt` charge `(long)fill * lvl->price` using
+whatever the level's *current* price is at fill time, not whatever price
+was in effect when the order was placed. A faithful multi-level book
+wouldn't do this; this one does, as a direct consequence of the
+fixed-slot model everything else here is already built on, not a new bug
+introduced by this feature.
+
+Tested the same way as everything else: a deterministic case (an ordinary
+upward drift, an ordinary downward drift, the cumulative effect of both,
+and a large downward drift that must be rejected outright at `MIN_PRICE`
+with zero state mutated), identical on baseline and opt; and a
+50,000-iteration randomized run that folds drift into the *existing*
+market/limit/cancel/modify_qty/modify_price workload rather than testing
+it in isolation — the point being to prove drift composes safely with
+every other operation this file already exercises, not just that it works
+on its own. Clean under `make asan`.
 
 ## Capability map
 

@@ -1216,6 +1216,198 @@ static int test_modify_order(void) {
     return failures;
 }
 
+// ============================================================================
+// Test 9: price drift (ob_drift_price_*).
+//
+// Every price level was frozen forever until now (see header comment on
+// ob_drift_price_*). Deterministic case: shift up, shift down, and the
+// floor rejection at MIN_PRICE — checked on both engines. Then a
+// randomized run mixing drift into the full existing workload (market/
+// limit/cancel/modify), diffing full state after every single operation —
+// this is the one that actually proves drift composes safely with
+// everything else already in this file, not just that it works in
+// isolation.
+// ============================================================================
+static int test_price_drift_deterministic(void) {
+    L3OrderBook ob_base, ob_opt;
+    EngineAccount acc_base, acc_opt;
+    ob_init_baseline(&ob_base, &acc_base, 100);
+    ob_init_opt(&ob_opt, &acc_opt, 100);
+
+    int fails = 0;
+
+    int r_base = ob_drift_price_baseline(&ob_base, 3);
+    int r_opt  = ob_drift_price_opt(&ob_opt, 3);
+    if (!r_base || !r_opt) {
+        printf("FAIL: an ordinary upward drift was rejected (base=%d opt=%d)\n", r_base, r_opt);
+        fails++;
+    }
+    for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
+        if (ob_base.bids[i].price != 100 - 1 - i + 3 || ob_opt.bids[i].price != 100 - 1 - i + 3 ||
+            ob_base.asks[i].price != 100 + 1 + i + 3 || ob_opt.asks[i].price != 100 + 1 + i + 3) {
+            printf("FAIL: drift did not shift every level by exactly delta (level %d)\n", i);
+            fails++;
+        }
+    }
+
+    r_base = ob_drift_price_baseline(&ob_base, -5);
+    r_opt  = ob_drift_price_opt(&ob_opt, -5);
+    if (!r_base || !r_opt) {
+        printf("FAIL: an ordinary downward drift was rejected (base=%d opt=%d)\n", r_base, r_opt);
+        fails++;
+    }
+    // Net drift so far: +3-5 = -2 -> lowest bid (index MAX_PRICE_LEVELS-1) is
+    // 100 - 1 - (MAX_PRICE_LEVELS-1) - 2.
+    int expect_lowest_bid = 100 - 1 - (MAX_PRICE_LEVELS - 1) - 2;
+    if (ob_base.bids[MAX_PRICE_LEVELS - 1].price != expect_lowest_bid ||
+        ob_opt.bids[MAX_PRICE_LEVELS - 1].price != expect_lowest_bid) {
+        printf("FAIL: cumulative drift produced the wrong lowest bid price (expected %d)\n", expect_lowest_bid);
+        fails++;
+    }
+
+    // Drive a big downward drift that must be rejected outright (would
+    // push a bid below MIN_PRICE) — nothing should change.
+    L3OrderBook ob_base_before = ob_base, ob_opt_before = ob_opt;
+    r_base = ob_drift_price_baseline(&ob_base, -1000000);
+    r_opt  = ob_drift_price_opt(&ob_opt, -1000000);
+    if (r_base || r_opt || !books_equal(&ob_base, &ob_base_before) || !books_equal(&ob_opt, &ob_opt_before)) {
+        printf("FAIL: a drift that would push a bid below MIN_PRICE was accepted or mutated state\n");
+        fails++;
+    }
+
+    if (!accounts_equal(&acc_base, &acc_opt) || !books_equal(&ob_base, &ob_opt)) {
+        printf("FAIL: baseline/opt diverged after the price-drift sequence\n");
+        fails++;
+    }
+
+    if (fails == 0) {
+        printf("PASS: price drift (upward, downward, cumulative, floor rejection leaving state "
+               "untouched) identical on baseline and opt\n");
+    }
+    return fails;
+}
+
+static int test_price_drift_random_stress(void) {
+    L3OrderBook ob_base, ob_opt;
+    EngineAccount acc_base, acc_opt;
+    ob_init_baseline(&ob_base, &acc_base, 100);
+    ob_init_opt(&ob_opt, &acc_opt, 100);
+
+    rng_state = 0xD121F7u; // fixed seed, independent stream
+    int fails = 0;
+
+    #define MAX_ISSUED 4096
+    int issued_ids[MAX_ISSUED];
+    int issued_count = 0;
+
+    const int ITERATIONS = 50000;
+    for (int i = 0; i < ITERATIONS && fails == 0; i++) {
+        int action = rand_range(0, 99);
+        int level = rand_range(0, MAX_PRICE_LEVELS - 1);
+        int qty = rand_range(1, 25);
+
+        if (action < 20) {
+            int is_player = rand_range(0, 3) == 0;
+            if (rand_range(0, 1)) {
+                ob_market_buy_baseline(&ob_base, &acc_base, qty, is_player);
+                ob_market_buy_opt(&ob_opt, &acc_opt, qty, is_player);
+            } else {
+                ob_market_sell_baseline(&ob_base, &acc_base, qty, is_player);
+                ob_market_sell_opt(&ob_opt, &acc_opt, qty, is_player);
+            }
+        } else if (action < 45) {
+            int id_base, id_opt;
+            if (rand_range(0, 1)) {
+                id_base = ob_place_limit_buy_baseline(&ob_base, &acc_base, level, qty);
+                id_opt  = ob_place_limit_buy_opt(&ob_opt, &acc_opt, level, qty);
+            } else {
+                id_base = ob_place_limit_sell_baseline(&ob_base, &acc_base, level, qty);
+                id_opt  = ob_place_limit_sell_opt(&ob_opt, &acc_opt, level, qty);
+            }
+            if (id_base != id_opt) {
+                printf("FAIL at iter %d: placement id diverged (base=%d opt=%d)\n", i, id_base, id_opt);
+                fails++;
+            }
+            if (id_base >= 0 && issued_count < MAX_ISSUED) issued_ids[issued_count++] = id_base;
+        } else if (action < 60 && issued_count > 0) {
+            int id = issued_ids[rand_range(0, issued_count - 1)];
+            int r_base = ob_cancel_order_baseline(&ob_base, &acc_base, id);
+            int r_opt  = ob_cancel_order_opt(&ob_opt, &acc_opt, id);
+            if (r_base != r_opt) {
+                printf("FAIL at iter %d: cancel(%d) result diverged (base=%d opt=%d)\n", i, id, r_base, r_opt);
+                fails++;
+            }
+        } else if (action < 75 && issued_count > 0) {
+            int id = issued_ids[rand_range(0, issued_count - 1)];
+            int new_qty = rand_range(1, 40);
+            int r_base = ob_modify_qty_baseline(&ob_base, &acc_base, id, new_qty);
+            int r_opt  = ob_modify_qty_opt(&ob_opt, &acc_opt, id, new_qty);
+            if (r_base != r_opt) {
+                printf("FAIL at iter %d: modify_qty(%d,%d) result diverged (base=%d opt=%d)\n",
+                       i, id, new_qty, r_base, r_opt);
+                fails++;
+            }
+        } else if (action < 90 && issued_count > 0) {
+            int id = issued_ids[rand_range(0, issued_count - 1)];
+            int new_level = rand_range(0, MAX_PRICE_LEVELS - 1);
+            int new_qty = rand_range(1, 25);
+            int new_id_base = ob_modify_price_baseline(&ob_base, &acc_base, id, new_level, new_qty);
+            int new_id_opt  = ob_modify_price_opt(&ob_opt, &acc_opt, id, new_level, new_qty);
+            if (new_id_base != new_id_opt) {
+                printf("FAIL at iter %d: modify_price(%d) result diverged (base=%d opt=%d)\n",
+                       i, id, new_id_base, new_id_opt);
+                fails++;
+            }
+            if (new_id_base >= 0 && issued_count < MAX_ISSUED) issued_ids[issued_count++] = new_id_base;
+        } else {
+            // Drift, including deltas large enough to sometimes hit the
+            // MIN_PRICE floor rejection path on purpose.
+            int delta = rand_range(-20, 20);
+            int r_base = ob_drift_price_baseline(&ob_base, delta);
+            int r_opt  = ob_drift_price_opt(&ob_opt, delta);
+            if (r_base != r_opt) {
+                printf("FAIL at iter %d: drift(%d) result diverged (base=%d opt=%d)\n", i, delta, r_base, r_opt);
+                fails++;
+            }
+        }
+
+        for (int lvl = 0; lvl < MAX_PRICE_LEVELS; lvl++) {
+            ob_clean_ghosts_baseline(&ob_base.bids[lvl]);
+            ob_clean_ghosts_opt(&ob_opt.bids[lvl]);
+            ob_clean_ghosts_baseline(&ob_base.asks[lvl]);
+            ob_clean_ghosts_opt(&ob_opt.asks[lvl]);
+        }
+        ob_update_total_qty_baseline(&ob_base);
+
+        if (!accounts_equal(&acc_base, &acc_opt)) {
+            printf("FAIL at iter %d: account state diverged (base cash=%ld inv=%d, "
+                   "opt cash=%ld inv=%d)\n", i, acc_base.my_cash, acc_base.my_inventory,
+                   acc_opt.my_cash, acc_opt.my_inventory);
+            fails++;
+        }
+        if (!books_equal(&ob_base, &ob_opt)) {
+            printf("FAIL at iter %d: book state diverged\n", i);
+            fails++;
+        }
+    }
+    #undef MAX_ISSUED
+
+    if (fails == 0) {
+        printf("PASS: %d randomized operations (market/limit/cancel/modify_qty/modify_price/drift, "
+               "mixed valid and invalid), baseline and opt stayed identical after every single "
+               "operation (final lowest bid=%d, %d order ids issued)\n",
+               ITERATIONS, ob_base.bids[MAX_PRICE_LEVELS - 1].price, issued_count);
+    }
+    return fails;
+}
+
+static int test_price_drift(void) {
+    int failures = 0;
+    failures += test_price_drift_deterministic();
+    failures += test_price_drift_random_stress();
+    return failures;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_tick_replay();
@@ -1226,6 +1418,7 @@ int main(void) {
     failures += test_risk_limit_end_to_end();
     failures += test_indexed_cancel();
     failures += test_modify_order();
+    failures += test_price_drift();
 
     if (failures == 0) {
         printf("\nALL TESTS PASSED\n");

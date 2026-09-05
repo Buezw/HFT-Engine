@@ -148,8 +148,8 @@
   </div>
 
   <div class="stats">
-    <div class="stat"><div class="v num">29</div><div class="l">个公开函数</div></div>
-    <div class="stat"><div class="v num">8</div><div class="l">组测试，含 3 个 5 万次随机压测</div></div>
+    <div class="stat"><div class="v num">34</div><div class="l">个公开函数</div></div>
+    <div class="stat"><div class="v num">9</div><div class="l">组测试，含 4 个 5 万次随机压测</div></div>
     <div class="stat"><div class="v num">47.4×</div><div class="l">索引查找 vs 线性扫描（深度 400）</div></div>
     <div class="stat"><div class="v num">-168,805</div><div class="l">无风控时库存能跑多偏（已修复）</div></div>
   </div>
@@ -234,9 +234,21 @@
     </div>
   </section>
 
+  <!-- ================= PRICE DRIFT ================= -->
+  <section>
+    <div class="sec-head"><span class="sec-no">03</span><h2>价格漂移</h2></div>
+    <p class="sec-desc">最早这几个价位是死的，挂了就再也不动——库存倾斜策略在这种市场里根本没有"行情跟你作对"这种风险可以防。这个函数是补上"市场自己会动"这件事之后加的。</p>
+    <div class="cap">
+      <div class="fnlist">
+        <div class="fnrow"><span class="tag both"></span><div><div class="sig"><span class="fn">ob_drift_price_*</span></div><div class="note">把买卖两边所有价位一起挪 delta，价差和档位间距不变——只是整个梯形挪了位置。它自己不决定"什么时候挪、挪多少"，跟市价单一样，由外面的场景/测试来喂</div></div></div>
+      </div>
+      <div class="finding"><b>诚实的简化：</b>这本书永远只有固定的 <code>MAX_PRICE_LEVELS</code> 档，不像真实盘口那样价位是随订单动态出现/消失的。所以"漂移"本质是把这几个固定档位的价格标签整体重贴，而不是真的生成新档位——挂在某一档里的单子，成交价会跟着这一档"现在"的价格走，不是挂单那一刻的价格。这是现有数据结构带来的真实限制，不是这个功能引入的新 bug。</div>
+    </div>
+  </section>
+
   <!-- ================= LIFECYCLE FUNCTIONS ================= -->
   <section>
-    <div class="sec-head"><span class="sec-no">03</span><h2>挂单生命周期</h2></div>
+    <div class="sec-head"><span class="sec-no">04</span><h2>挂单生命周期</h2></div>
     <p class="sec-desc">main.c 从来没写过"自己挂一个限价单"的功能——虽然到处都在检查 is_mine，就是没有地方把它设成 1。这一整块是补全的，不是移植的。</p>
     <div class="cap">
       <div class="fnlist">
@@ -250,7 +262,7 @@
 
   <!-- ================= RISK ================= -->
   <section>
-    <div class="sec-head"><span class="sec-no">04</span><h2>风控</h2></div>
+    <div class="sec-head"><span class="sec-no">05</span><h2>风控</h2></div>
     <p class="sec-desc">main.c 的市价单完全没有仓位上限——随机压测直接把库存打到 -168,805，暴露出这个洞之后才补上的。</p>
     <div class="cap">
       <div class="fnlist">
@@ -262,7 +274,7 @@
 
   <!-- ================= INDEX ================= -->
   <section>
-    <div class="sec-head"><span class="sec-no">05</span><h2>O(1) 索引</h2></div>
+    <div class="sec-head"><span class="sec-no">06</span><h2>O(1) 索引</h2></div>
     <p class="sec-desc">书浅的时候（板子上实际只有 60 笔单子）挨个扫一遍完全不是问题；书一旦变深，"挨个扫"就扫不动了。</p>
     <div class="cap">
       <div class="fnlist">
@@ -330,7 +342,7 @@
 
   <!-- ================= CONCURRENCY ================= -->
   <section>
-    <div class="sec-head"><span class="sec-no">06</span><h2>并发基础设施</h2></div>
+    <div class="sec-head"><span class="sec-no">07</span><h2>并发基础设施</h2></div>
     <p class="sec-desc">撮合本身永远单线程（一本账必须按顺序处理）。能并行的是"收单子"和"真正撮合"这两件事。</p>
     <div class="cap">
       <figure>
@@ -421,11 +433,11 @@
 
   <!-- ================= VERIFICATION ================= -->
   <section>
-    <div class="sec-head"><span class="sec-no">07</span><h2>验证与工具</h2></div>
+    <div class="sec-head"><span class="sec-no">08</span><h2>验证与工具</h2></div>
     <p class="sec-desc">这个项目的核心纪律：先证明"一样"，才谈"更快"。</p>
     <div class="cap">
       <div class="fnlist">
-        <div class="fnrow"><span class="tag both"></span><div><div class="sig">tests/test_correctness.c</div><div class="note">200k-tick 回放 + 3 组各 5 万次随机压测，每一步都比对 baseline/opt 状态</div></div></div>
+        <div class="fnrow"><span class="tag both"></span><div><div class="sig">tests/test_correctness.c</div><div class="note">200k-tick 回放 + 4 组各 5 万次随机压测，每一步都比对 baseline/opt 状态</div></div></div>
         <div class="fnrow"><span class="tag both"></span><div><div class="sig">tests/test_spsc_ring.c</div><div class="note">200 万条消息的真·双线程压测，专门跑在 ThreadSanitizer 下（ASan 抓不到数据竞争）</div></div></div>
         <div class="fnrow"><span class="tag both"></span><div><div class="sig">bench/*.c + make visualize</div><div class="note">延迟分布（p50/p99）、深度扫描、可拖动的网页版盘口回放</div></div></div>
       </div>

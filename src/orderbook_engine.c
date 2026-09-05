@@ -499,6 +499,33 @@ int ob_modify_price_opt(L3OrderBook *ob, EngineAccount *acc, int order_id, int n
 }
 
 // ============================================================================
+// PRICE DRIFT. See header for what this is, why it's needed, and the
+// honest limitation (an order resting through a drift gets repriced along
+// with its level, a direct consequence of the fixed-slot book model).
+// ============================================================================
+int ob_drift_price_baseline(L3OrderBook *ob, int delta) {
+    for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
+        if (ob->bids[i].price + delta < MIN_PRICE) return 0;
+    }
+    for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
+        ob->bids[i].price += delta;
+        ob->asks[i].price += delta;
+    }
+    return 1;
+}
+
+int ob_drift_price_opt(L3OrderBook *ob, int delta) {
+    for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
+        if (ob->bids[i].price + delta < MIN_PRICE) return 0;
+    }
+    for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
+        ob->bids[i].price += delta;
+        ob->asks[i].price += delta;
+    }
+    return 1;
+}
+
+// ============================================================================
 // PRE-TRADE RISK LIMIT — a layer on top of ob_market_buy_*/ob_market_sell_*,
 // not a change to them. See header comment for the -168,805 stress-test
 // result that motivated this and why it wraps rather than modifies the

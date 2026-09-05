@@ -18,9 +18,10 @@
 //
 // Deliberately reuses the engine's public API only (ob_market_*_opt,
 // ob_place_limit_*_opt_indexed, ob_cancel_order_opt_indexed,
-// ob_clean_ghosts_opt) — this is a viewer, not a second implementation of
-// anything, and it's the same harness that will show whatever
-// market-making/quoting logic gets layered on top later, unchanged.
+// ob_drift_price_opt, ob_clean_ghosts_opt) — this is a viewer, not a
+// second implementation of anything, and it's the same harness that will
+// show whatever market-making/quoting logic gets layered on top later,
+// unchanged.
 // ============================================================================
 #include <stdio.h>
 #include <stdlib.h>
@@ -160,6 +161,18 @@ int main(int argc, char **argv) {
             snprintf(event, sizeof(event),
                      "tick %d: player risk-checked order requested %d, submitted %d "
                      "(inventory %d)", t, qty, submitted, acc.my_inventory);
+        }
+
+        // Price drift — the market moving on its own, not in response to
+        // anything the player or the noise flow did. Small step, every
+        // few ticks, so the ladder visibly walks instead of sitting
+        // frozen at its ob_init_opt value for the whole replay.
+        if (t % 4 == 0) {
+            int delta = rand_range(0, 1) ? 1 : -1;
+            if (ob_drift_price_opt(&ob, delta)) {
+                snprintf(event, sizeof(event), "tick %d: price drifted %s%d (mid now %d)",
+                         t, delta > 0 ? "+" : "", delta, (ob.bids[0].price + ob.asks[0].price) / 2);
+            }
         }
 
         for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
