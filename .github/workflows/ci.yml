@@ -17,6 +17,9 @@ jobs:
       - name: Build + run benchmark (gcc)
         run: make bench
 
+      - name: Build + run LOBSTER replay against the committed synthetic fixture (gcc)
+        run: make lobster-test
+
       - name: Build + run correctness tests under ASan/UBSan (clang)
         run: make asan
 

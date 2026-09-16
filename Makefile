@@ -10,6 +10,19 @@ RING_TEST_SRC = tests/test_spsc_ring.c
 BENCH_SRC   = bench/benchmark.c
 TRACE_SRC   = tools/book_trace.c
 THREAD_SRC  = bench/threaded_bench.c
+LOBSTER_SRC = tools/lobster_replay.c
+
+# Real LOBSTER samples have a matching depth (5/10/50 populated levels);
+# default to the committed synthetic fixture (see
+# tests/fixtures/lobster_sample/README.md) so `make lobster-test` works
+# out of the box with no download. Override all three for real data, e.g.:
+#   make lobster-test LOBSTER_MSG=data/lobster/AMZN_message.csv \
+#     LOBSTER_BOOK=data/lobster/AMZN_orderbook.csv LOBSTER_TICK=100 \
+#     LOBSTER_LEVELS=10
+LOBSTER_MSG    ?= tests/fixtures/lobster_sample/message.csv
+LOBSTER_BOOK   ?= tests/fixtures/lobster_sample/orderbook.csv
+LOBSTER_TICK   ?= 1
+LOBSTER_LEVELS ?= 3
 
 TSAN_CC    ?= clang
 TSAN_FLAGS = -O1 -g -fsanitize=thread -Wall -Wextra -Iinclude -pthread
@@ -18,7 +31,7 @@ BUILD_DIR = build
 
 DEPTHS = 10 25 50 100 200 400
 
-.PHONY: all test bench asan clean cppcheck depth-sweep visualize threaded-bench tsan
+.PHONY: all test bench asan clean cppcheck depth-sweep visualize threaded-bench tsan lobster-test lobster-bench
 
 all: $(BUILD_DIR)/test_correctness $(BUILD_DIR)/benchmark
 
@@ -100,10 +113,33 @@ threaded-bench: $(BUILD_DIR)/threaded_bench
 $(BUILD_DIR)/threaded_bench: $(THREAD_SRC) $(SRC) $(RING_SRC) include/orderbook_engine.h include/spsc_ring.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -pthread -o $@ $(THREAD_SRC) $(SRC) $(RING_SRC)
 
+# Replays a real (or, by default, the committed synthetic fixture's)
+# LOBSTER message stream through the engine and cross-checks the result
+# against LOBSTER's own reconstructed orderbook snapshots -- external
+# ground truth, not the baseline-vs-opt self-consistency tests above.
+# MAX_PRICE_LEVELS is compiled in at LOBSTER_LEVELS so the engine's fixed
+# per-tick window matches how deep the input data actually is (see
+# tools/lobster_replay.c's header for why this has to be a build-time
+# choice, same reasoning as depth-sweep's MAX_ORDERS_PER_LVL).
+lobster-test: $(BUILD_DIR)/lobster_replay
+	./$(BUILD_DIR)/lobster_replay $(LOBSTER_MSG) $(LOBSTER_BOOK) $(LOBSTER_TICK)
+
+$(BUILD_DIR)/lobster_replay: $(LOBSTER_SRC) tools/lobster_format.h $(SRC) include/orderbook_engine.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DMAX_PRICE_LEVELS=$(LOBSTER_LEVELS) -o $@ $(LOBSTER_SRC) $(SRC)
+
+# Correctness first, always -- same discipline `bench` already applies to
+# the synthetic benchmark: a latency number from a replay that hasn't
+# passed ground-truth validation isn't worth reporting.
+lobster-bench: lobster-test $(BUILD_DIR)/lobster_bench
+	./$(BUILD_DIR)/lobster_bench $(LOBSTER_MSG) $(LOBSTER_TICK)
+
+$(BUILD_DIR)/lobster_bench: bench/lobster_bench.c tools/lobster_format.h $(SRC) include/orderbook_engine.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -DMAX_PRICE_LEVELS=$(LOBSTER_LEVELS) -Itools -o $@ bench/lobster_bench.c $(SRC)
+
 cppcheck:
 	cppcheck --enable=warning,style,performance,portability \
 		--suppress=missingIncludeSystem --error-exitcode=1 \
-		-Iinclude src/ bench/ tests/
+		-Iinclude src/ bench/ tests/ tools/
 
 clean:
 	rm -rf $(BUILD_DIR)

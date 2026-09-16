@@ -34,9 +34,13 @@ tools/capability_map.html    static reference: every public function, plain-lang
 include/spsc_ring.h / src/spsc_ring.c   lock-free single-producer/single-consumer queue
 tests/test_spsc_ring.c       FIFO/capacity boundary tests + a real 2M-item multithreaded stress test
 bench/threaded_bench.c       measures whether splitting receive/match onto two threads helps or hurts
+tools/lobster_format.h       shared LOBSTER message-format decoding (used by the two tools below)
+tools/lobster_replay.c       replays real order flow, cross-checks book state against LOBSTER ground truth
+bench/lobster_bench.c        baseline-vs-opt latency under real (not synthetic) order flow
+tests/fixtures/lobster_sample/  hand-built LOBSTER-format fixture, regression-tests the replay tool itself
 scripts/format_depth_sweep.awk  tabulates `make depth-sweep` output
-Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep / visualize / threaded-bench / clean targets
-.github/workflows/ci.yml     runs test / bench / asan / tsan / cppcheck on every push/PR
+Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep / visualize / threaded-bench / lobster-test / lobster-bench / clean targets
+.github/workflows/ci.yml     runs test / bench / lobster-test / asan / tsan / cppcheck on every push/PR
 ```
 
 - `board/main.c` — the original bare-metal program, with one real bug fixed
@@ -55,10 +59,13 @@ Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep
     (`ob_market_*_risk_checked_*`), an O(1) cancel-by-id index
     (`OrderIndex`, `ob_place_limit_*_opt_indexed`,
     `ob_cancel_order_opt_indexed`), cancel-replace order modification
-    (`ob_modify_qty_*`, `ob_modify_price_*`, `+_opt_indexed`), and price
-    drift (`ob_drift_price_*`) — all new in the extracted engine, not
-    ports of anything in `main.c`.
-- `tests/test_correctness.c` — nine things, in order: (1) replays 200,000
+    (`ob_modify_qty_*`, `ob_modify_price_*`, `+_opt_indexed`), price
+    drift (`ob_drift_price_*`), and third-party order cancel/qty-reduce
+    (`ob_cancel_order_any_*`, `ob_reduce_order_qty_any_*`, for orders that
+    aren't the player's own — see "LOBSTER real-market-data validation"
+    below) — all new in the extracted engine, not ports of anything in
+    `main.c`.
+- `tests/test_correctness.c` — ten things, in order: (1) replays 200,000
   ticks of synthetic market-maker + player activity against both engines
   and asserts identical account state and book state after every tick —
   this has to pass before any benchmark number means anything; (2) a
@@ -80,7 +87,12 @@ Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep
   match the plain whole-book-scan ones; (9) price drift's deterministic
   case (up, down, cumulative, floor rejection) and a 50,000-iteration
   randomized run folding drift into the full existing market/limit/
-  cancel/modify workload, not testing it in isolation.
+  cancel/modify workload, not testing it in isolation; (10) third-party
+  (`is_mine=0`) order cancel/qty-reduce — confirms the existing
+  `is_mine`-gated functions correctly ignore such an order, and
+  `ob_cancel_order_any_*`/`ob_reduce_order_qty_any_*` correctly find and
+  mutate it (partial reduce, exact-zero-removal, reject-over-large,
+  bogus-id).
 - `bench/benchmark.c` — measures baseline vs optimized under identical
   workload using `clock_gettime(CLOCK_MONOTONIC)`, reporting the mean,
   the p50/p90/p99/p99.9 latency distribution per tick, (via
@@ -97,6 +109,13 @@ Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep
   is a data race, not a memory-safety bug — ThreadSanitizer specifically
   (`make tsan`). See "Threaded ingestion" below for what this is for and
   what got measured.
+- `tools/lobster_format.h` / `tools/lobster_replay.c` / `bench/lobster_bench.c`
+  — replays a real LOBSTER order-flow stream through both engines,
+  cross-checks the result against LOBSTER's own reconstructed order book
+  (external ground truth, not a baseline-vs-opt self-check), and
+  separately benchmarks the same translated calls under real (not
+  synthetic) timing/size distributions. See "LOBSTER real-market-data
+  validation" below.
 
 ## Bug fixed in `main.c`
 
@@ -628,6 +647,89 @@ linear-scan numbers (re-measured at 6 depths, not just the two points
 quoted elsewhere in this README). Open it directly in a browser — no
 `make` target, nothing to generate, it's just a file.
 
+## LOBSTER real-market-data validation
+
+Every correctness result above comes from one engine checked against
+itself: `tests/test_correctness.c` replays synthetic order flow through
+both `_baseline` and `_opt` and `memcmp`s the result. That proves the two
+implementations agree; it can't catch a bug both of them share (which is
+exactly what happened once already — see "A fill-direction bug" below).
+The next step up in rigor is checking the engine against *external*
+ground truth: a real exchange's own reconstructed order book, driven by
+real order flow this engine never saw synthesized.
+
+[LOBSTER](https://lobsterdata.com) publishes exactly that for NASDAQ: a
+message file (every submission/cancel/delete/execution, timestamped to
+the nanosecond) paired line-for-line with an orderbook file (the
+independently reconstructed book snapshot after each message). `make
+lobster-test` (`tools/lobster_replay.c`) replays the message stream
+through both `_baseline` and `_opt`, translating each LOBSTER event into
+calls on this engine's public API, and cross-checks the result against
+the paired orderbook file after every synced event. `make lobster-bench`
+(`bench/lobster_bench.c`, sharing the same message-format decoding via
+`tools/lobster_format.h`) times the same translated calls instead of
+checking them, to see whether real inter-arrival timing and order-size
+distributions change the p99/p99.9 tail latency the synthetic
+`depth-sweep` table above reports.
+
+**Two real gaps this surfaced in the existing API**, both fixed with pure
+additions (nothing already-tested changed):
+
+- `ob_cancel_order_opt`/`ob_modify_qty_opt` only ever touch `is_mine==1`
+  orders (they refund a cash/inventory reservation that only exists for
+  the player's own resting orders). LOBSTER's cancels overwhelmingly
+  target orders belonging to anonymous third parties, injected via
+  `ob_add_order_*` the same way market-maker/noise liquidity always has
+  been — and until now, nothing could cancel or reduce those by id.
+  `ob_cancel_order_any_*`/`ob_reduce_order_qty_any_*` (same file, right
+  after the functions they mirror) do exactly that, minus the `is_mine`
+  filter and the refund, with their own differential test coverage.
+- `MAX_PRICE_LEVELS` was hardcoded at 3, unlike `MAX_ORDERS_PER_LVL`,
+  which `make depth-sweep` already overrides at compile time. It's now
+  the same kind of build-time knob (`-DMAX_PRICE_LEVELS=N`), so a replay
+  can be validated at whatever depth the downloaded LOBSTER sample
+  actually has. Confirmed safe before changing it: every loop bound and
+  array access across `src/`, `tests/`, and `bench/` already referenced
+  the macro symbolically — grep found zero hardcoded `3`s standing in
+  for it, so this was a one-line change, not a refactor.
+
+**A representational mismatch worth understanding before trusting any
+comparison output**: this engine has `MAX_PRICE_LEVELS` fixed *ticks* per
+side, always exactly one tick apart — `ob_drift_price_*` relabels where
+the whole ladder sits, but never changes that spacing. LOBSTER's
+orderbook file instead lists `MAX_PRICE_LEVELS` *populated* price levels,
+which can be many ticks apart if the book has gaps. Comparing "engine
+slot `i`" straight against "LOBSTER column `i`" would report false
+mismatches every time the real book has a gap inside the compared range.
+`lobster_replay.c`'s `compare_side()` instead reconstructs a dense
+per-tick view from LOBSTER's sparse listed levels first (a tick between
+two listed prices is genuinely empty — LOBSTER only lists a level with at
+least one resting order) and compares that, tick for tick, against the
+engine's fixed slots.
+
+**Status, honestly**: this sandbox couldn't reach LOBSTER's actual sample
+downloads to validate against a real trading day — the site is now a
+JS-rendered SPA whose real download API isn't reachable by a static
+fetch, and no working browser automation was available at the time this
+was built. `tests/fixtures/lobster_sample/` is a small, hand-constructed
+fixture in LOBSTER's documented format instead (see its README) that
+exercises every message type this adapter has to translate, including a
+submission that improves the best (drift), a same-timestamp multi-level
+execution sweep, and a trading halt marker — `make lobster-test` runs
+against it by default and is wired into CI. Running against a real
+sample is one command once you have one:
+
+```bash
+make lobster-test  LOBSTER_MSG=data/lobster/TICKER_message.csv \
+                    LOBSTER_BOOK=data/lobster/TICKER_orderbook.csv \
+                    LOBSTER_TICK=100 LOBSTER_LEVELS=10
+make lobster-bench  LOBSTER_MSG=data/lobster/TICKER_message.csv LOBSTER_TICK=100
+```
+(`LOBSTER_TICK` is LOBSTER's price units per tick — 100 for a $0.01 tick
+in most large-cap samples, but confirm against the specific ticker's data
+rather than assuming; `data/lobster/` is gitignored, real market data
+shouldn't be committed.)
+
 ## Threaded ingestion: does splitting receive from matching actually help?
 
 The engine's matching functions (`ob_market_*_opt` etc.) are, and stay,
@@ -722,6 +824,8 @@ make depth-sweep  # ~35s: the table in the Results section above, regenerated li
 make visualize    # builds build/book_visualizer.html — open it in a browser
 open tools/capability_map.html  # static reference, no build step, no code reading
 make threaded-bench  # the receive/match threading comparison above, regenerated live
+make lobster-test    # LOBSTER ground-truth replay (fixture by default, see LOBSTER_MSG/etc above)
+make lobster-bench   # real-order-flow latency benchmark, same LOBSTER_* overrides
 make clean        # remove build/
 ```
 
@@ -735,10 +839,11 @@ gcc -O2 -Wall -Wextra -Iinclude -o benchmark bench/benchmark.c src/orderbook_eng
 ./benchmark
 ```
 
-CI (`.github/workflows/ci.yml`) runs `test`/`bench`/`asan`/`cppcheck` on
-every push and pull request (`depth-sweep` is not in CI — it's a
-deliberately slow, occasional-use target, not something that should gate
-every commit).
+CI (`.github/workflows/ci.yml`) runs `test`/`bench`/`lobster-test`/`asan`/
+`cppcheck` on every push and pull request (`depth-sweep` is not in CI —
+it's a deliberately slow, occasional-use target, not something that
+should gate every commit; `lobster-bench` isn't either, for the same
+reason benchmarks generally aren't CI gates).
 
 ## How to talk about this project in an interview
 

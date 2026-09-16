@@ -18,7 +18,13 @@
 
 #include <stdint.h>
 
+// Overridable via -DMAX_PRICE_LEVELS=N at compile time (see
+// `make lobster-test`), so a real order-flow replay can be validated
+// against ground-truth snapshots deeper than the board's real value of 3
+// — without touching this file for every depth tested.
+#ifndef MAX_PRICE_LEVELS
 #define MAX_PRICE_LEVELS   3
+#endif
 // Overridable via -DMAX_ORDERS_PER_LVL=N at compile time (see
 // `make depth-sweep`), to measure how the clean_ghosts/update_total_qty
 // optimizations scale as book depth grows past the board's real value of
@@ -209,6 +215,30 @@ int ob_modify_qty_opt     (L3OrderBook *ob, EngineAccount *acc, int order_id, in
 // order still live, nothing changed).
 int ob_modify_price_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id, int new_level, int new_qty);
 int ob_modify_price_opt     (L3OrderBook *ob, EngineAccount *acc, int order_id, int new_level, int new_qty);
+
+// ----------------------------------------------------------------------
+// Third-party (is_mine=0) order cancel / qty-reduce — for replaying real
+// order flow (e.g. LOBSTER), where cancelled/reduced orders overwhelmingly
+// belong to anonymous participants, not "the player". ob_cancel_order_*/
+// ob_modify_qty_* above only ever touch is_mine=1 orders (they refund a
+// cash/inventory reservation that only is_mine orders have); these two
+// mirror that logic minus the is_mine filter and the refund, so an order
+// injected via ob_add_order_*(is_mine=0) can be cancelled or reduced by id
+// too. No existing function's behavior changes.
+//
+// ob_cancel_order_any_*: same 1/0 contract as ob_cancel_order_*, but finds
+// and removes a live order regardless of is_mine.
+int ob_cancel_order_any_baseline(L3OrderBook *ob, int order_id);
+int ob_cancel_order_any_opt     (L3OrderBook *ob, int order_id);
+
+// ob_reduce_order_qty_any_*: delta_qty is an amount to REMOVE from the
+// order's current qty (LOBSTER Type 2 semantics), not a new absolute
+// quantity like ob_modify_qty_*'s new_qty. Rejects (nothing mutated) if
+// delta_qty <= 0 or delta_qty > the order's current qty; delta_qty equal
+// to the current qty fully removes the order. Returns 1 on success, 0 on
+// rejection or if order_id isn't a live order.
+int ob_reduce_order_qty_any_baseline(L3OrderBook *ob, int order_id, int delta_qty);
+int ob_reduce_order_qty_any_opt     (L3OrderBook *ob, int order_id, int delta_qty);
 
 // ----------------------------------------------------------------------
 // Price drift — not present in main.c or anywhere else in this engine

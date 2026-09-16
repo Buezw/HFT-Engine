@@ -3,3 +3,8 @@ build/
 *.out
 test_correctness
 benchmark
+
+# Real LOBSTER downloads (not the synthetic fixture under tests/fixtures/)
+# -- raw market data shouldn't be committed.
+data/lobster/*
+!data/lobster/.gitkeep

@@ -1408,6 +1408,123 @@ static int test_price_drift(void) {
     return failures;
 }
 
+// ============================================================================
+// Test: third-party (is_mine=0) order cancel / qty-reduce — the
+// ob_cancel_order_any_*/ob_reduce_order_qty_any_* support added for
+// replaying real order flow (e.g. LOBSTER), where cancelled/reduced orders
+// overwhelmingly belong to anonymous participants, not "the player".
+// Confirms the existing is_mine-gated functions correctly ignore such an
+// order, and the new any-* functions correctly find and mutate it.
+// ============================================================================
+static int test_any_order_cancel_reduce_lifecycle(void) {
+    L3OrderBook ob_base, ob_opt;
+    EngineAccount acc_base, acc_opt;
+    ob_init_baseline(&ob_base, &acc_base, 100);
+    ob_init_opt(&ob_opt, &acc_opt, 100);
+
+    int fails = 0;
+
+    // Inject a third-party (is_mine=0) resting bid, same mechanism this
+    // engine already uses for market-maker/noise liquidity injection.
+    L3Order third_party = {7001, 20, 0, /*is_mine=*/0, 0};
+    if (!ob_add_order_baseline(&ob_base.bids[0], third_party) ||
+        !ob_add_order_opt(&ob_opt.bids[0], third_party)) {
+        printf("FAIL: setup insertion of third-party order failed\n");
+        return 1;
+    }
+    ob_update_total_qty_baseline(&ob_base); // opt already updated incrementally inside ob_add_order_opt
+
+    // --- the existing is_mine-gated functions must ignore it entirely ---
+    if (ob_cancel_order_baseline(&ob_base, &acc_base, 7001) ||
+        ob_cancel_order_opt(&ob_opt, &acc_opt, 7001) ||
+        ob_modify_qty_baseline(&ob_base, &acc_base, 7001, 5) ||
+        ob_modify_qty_opt(&ob_opt, &acc_opt, 7001, 5)) {
+        printf("FAIL: is_mine-gated cancel/modify_qty touched a third-party order\n");
+        fails++;
+    }
+    if (!order_live_at(&ob_base, 1, 0, 7001, 20) || !order_live_at(&ob_opt, 1, 0, 7001, 20)) {
+        printf("FAIL: third-party order was mutated by an is_mine-gated call\n");
+        fails++;
+    }
+
+    // --- ob_reduce_order_qty_any_*: reject an over-large reduce, nothing mutated ---
+    if (ob_reduce_order_qty_any_baseline(&ob_base, 7001, 999) ||
+        ob_reduce_order_qty_any_opt(&ob_opt, 7001, 999)) {
+        printf("FAIL: over-large qty reduce was accepted\n");
+        fails++;
+    }
+    if (!order_live_at(&ob_base, 1, 0, 7001, 20) || !order_live_at(&ob_opt, 1, 0, 7001, 20)) {
+        printf("FAIL: rejected qty reduce mutated the order anyway\n");
+        fails++;
+    }
+
+    // --- ob_reduce_order_qty_any_*: partial reduce, order stays live at new qty ---
+    if (!ob_reduce_order_qty_any_baseline(&ob_base, 7001, 8) ||
+        !ob_reduce_order_qty_any_opt(&ob_opt, 7001, 8)) {
+        printf("FAIL: valid partial qty reduce was rejected\n");
+        fails++;
+    }
+    if (!order_live_at(&ob_base, 1, 0, 7001, 12) || !order_live_at(&ob_opt, 1, 0, 7001, 12)) {
+        printf("FAIL: partial qty reduce left the wrong quantity resting\n");
+        fails++;
+    }
+
+    // --- ob_reduce_order_qty_any_*: reduce down to exactly 0 fully removes it ---
+    if (!ob_reduce_order_qty_any_baseline(&ob_base, 7001, 12) ||
+        !ob_reduce_order_qty_any_opt(&ob_opt, 7001, 12)) {
+        printf("FAIL: exact-zero qty reduce was rejected\n");
+        fails++;
+    }
+    if (order_live_at(&ob_base, 1, 0, 7001, 0) || order_live_at(&ob_opt, 1, 0, 7001, 0)) {
+        printf("FAIL: exact-zero qty reduce did not fully remove the order\n");
+        fails++;
+    }
+
+    // --- ob_cancel_order_any_*: inject another third-party order, cancel it ---
+    L3Order third_party2 = {7002, 15, 0, /*is_mine=*/0, 0};
+    if (!ob_add_order_baseline(&ob_base.asks[0], third_party2) ||
+        !ob_add_order_opt(&ob_opt.asks[0], third_party2)) {
+        printf("FAIL: setup insertion of second third-party order failed\n");
+        return ++fails;
+    }
+    ob_update_total_qty_baseline(&ob_base);
+
+    if (!ob_cancel_order_any_baseline(&ob_base, 7002) || !ob_cancel_order_any_opt(&ob_opt, 7002)) {
+        printf("FAIL: ob_cancel_order_any_* rejected a live third-party order\n");
+        fails++;
+    }
+    if (order_live_at(&ob_base, 0, 0, 7002, 0) || order_live_at(&ob_opt, 0, 0, 7002, 0)) {
+        printf("FAIL: ob_cancel_order_any_* did not remove the order\n");
+        fails++;
+    }
+
+    // --- bogus id: both any-* functions must just fail, nothing mutated ---
+    if (ob_cancel_order_any_baseline(&ob_base, 999999) || ob_cancel_order_any_opt(&ob_opt, 999999) ||
+        ob_reduce_order_qty_any_baseline(&ob_base, 999999, 1) || ob_reduce_order_qty_any_opt(&ob_opt, 999999, 1)) {
+        printf("FAIL: any-* functions accepted a bogus order id\n");
+        fails++;
+    }
+
+    for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
+        ob_clean_ghosts_baseline(&ob_base.bids[i]);
+        ob_clean_ghosts_opt(&ob_opt.bids[i]);
+        ob_clean_ghosts_baseline(&ob_base.asks[i]);
+        ob_clean_ghosts_opt(&ob_opt.asks[i]);
+    }
+    ob_update_total_qty_baseline(&ob_base);
+    if (!accounts_equal(&acc_base, &acc_opt) || !books_equal(&ob_base, &ob_opt)) {
+        printf("FAIL: baseline/opt diverged after the any-cancel/reduce sequence\n");
+        fails++;
+    }
+
+    if (fails == 0) {
+        printf("PASS: third-party (is_mine=0) order cancel/qty-reduce (is_mine-gated calls "
+               "correctly ignore it, any-* partial reduce/exact-zero-removal/reject-over-large/"
+               "bogus-id all correct) identical on baseline and opt\n");
+    }
+    return fails;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_tick_replay();
@@ -1419,6 +1536,7 @@ int main(void) {
     failures += test_indexed_cancel();
     failures += test_modify_order();
     failures += test_price_drift();
+    failures += test_any_order_cancel_reduce_lifecycle();
 
     if (failures == 0) {
         printf("\nALL TESTS PASSED\n");

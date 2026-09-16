@@ -524,6 +524,112 @@ int ob_modify_price_opt(L3OrderBook *ob, EngineAccount *acc, int order_id, int n
 }
 
 // ============================================================================
+// THIRD-PARTY (is_mine=0) ORDER CANCEL / QTY REDUCE — support for replaying
+// real order flow (e.g. LOBSTER), where the vast majority of orders belong
+// to anonymous market participants, not "the player". ob_cancel_order_*/
+// ob_modify_qty_* above are deliberately scoped to is_mine=1 orders (they
+// refund cash/inventory reserved at placement, which only is_mine orders
+// ever have); orders injected directly via ob_add_order_*(is_mine=0) — the
+// mechanism already used for market-maker/noise liquidity — had no public
+// way to be cancelled or reduced by id before this. These mirror the
+// existing cancel/modify-qty logic with the is_mine filter and cash/
+// inventory bookkeeping removed; nothing about ob_cancel_order_*/
+// ob_modify_qty_* above changes.
+// ============================================================================
+
+// Same shared linear scan as find_live_mine_order, minus the is_mine
+// filter, so it finds a live order regardless of who it belongs to.
+static L3Order *find_live_any_order(L3OrderBook *ob, int order_id, int *out_is_bid, int *out_level) {
+    for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
+        for (int q = 0; q < ob->bids[i].order_count; q++) {
+            L3Order *o = &ob->bids[i].queue[q];
+            if (o->order_id == order_id && o->qty > 0 && o->state != 2) {
+                *out_is_bid = 1; *out_level = i; return o;
+            }
+        }
+        for (int q = 0; q < ob->asks[i].order_count; q++) {
+            L3Order *o = &ob->asks[i].queue[q];
+            if (o->order_id == order_id && o->qty > 0 && o->state != 2) {
+                *out_is_bid = 0; *out_level = i; return o;
+            }
+        }
+    }
+    return NULL;
+}
+
+int ob_cancel_order_any_baseline(L3OrderBook *ob, int order_id) {
+    int is_bid, level;
+    L3Order *o = find_live_any_order(ob, order_id, &is_bid, &level);
+    if (!o) return 0;
+
+    o->ghost_qty = o->qty;
+    o->qty = 0;
+    o->state = 2; // same ghost mechanism a full fill/is_mine cancel uses
+    // total_qty stays correct only after the next ob_update_total_qty_baseline()
+    // rescan — same as every other baseline mutation site, matching main.c.
+    return 1;
+}
+
+int ob_cancel_order_any_opt(L3OrderBook *ob, int order_id) {
+    int is_bid, level;
+    L3Order *o = find_live_any_order(ob, order_id, &is_bid, &level);
+    if (!o) return 0;
+
+    int qty = o->qty;
+    o->ghost_qty = qty;
+    o->qty = 0;
+    o->state = 2;
+
+    if (is_bid) ob->bids[level].total_qty -= qty; // incremental, matches ob_cancel_order_opt's pattern
+    else        ob->asks[level].total_qty -= qty;
+    return 1;
+}
+
+// LOBSTER's Type 2 (partial cancellation) Size field is an amount REMOVED,
+// not a new absolute quantity — the opposite convention from
+// ob_modify_qty_*'s new_qty. delta_qty > current qty is rejected outright
+// (nothing mutated), matching this codebase's "reject, don't clamp"
+// discipline everywhere else. delta_qty == current qty fully removes the
+// order, same as ob_cancel_order_any_*.
+int ob_reduce_order_qty_any_baseline(L3OrderBook *ob, int order_id, int delta_qty) {
+    if (delta_qty <= 0) return 0;
+    int is_bid, level;
+    L3Order *o = find_live_any_order(ob, order_id, &is_bid, &level);
+    if (!o) return 0;
+    if (delta_qty > o->qty) return 0;
+
+    if (delta_qty == o->qty) {
+        o->ghost_qty = o->qty;
+        o->qty = 0;
+        o->state = 2;
+    } else {
+        o->qty -= delta_qty;
+    }
+    // total_qty stays correct only after the next ob_update_total_qty_baseline()
+    // rescan — same as every other baseline mutation site, matching main.c.
+    return 1;
+}
+
+int ob_reduce_order_qty_any_opt(L3OrderBook *ob, int order_id, int delta_qty) {
+    if (delta_qty <= 0) return 0;
+    int is_bid, level;
+    L3Order *o = find_live_any_order(ob, order_id, &is_bid, &level);
+    if (!o) return 0;
+    if (delta_qty > o->qty) return 0;
+
+    L3PriceLevel *lvl = is_bid ? &ob->bids[level] : &ob->asks[level];
+    if (delta_qty == o->qty) {
+        o->ghost_qty = o->qty;
+        o->qty = 0;
+        o->state = 2;
+    } else {
+        o->qty -= delta_qty;
+    }
+    lvl->total_qty -= delta_qty; // incremental, matches every other opt mutation site
+    return 1;
+}
+
+// ============================================================================
 // PRICE DRIFT. See header for what this is, why it's needed, and the
 // honest limitation (an order resting through a drift gets repriced along
 // with its level, a direct consequence of the fixed-slot book model).
