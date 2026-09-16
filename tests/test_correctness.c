@@ -734,6 +734,102 @@ static int test_any_order_cancel_reduce_lifecycle(void) {
     return fails;
 }
 
+// ============================================================================
+// Test 8: a resting order getting filled must not touch the leg that was
+// already reserved at placement (cash for a buy, inventory for a sell) --
+// found by real LOBSTER-driven backtest P&L coming out wrong: a resting
+// fill was settling BOTH legs, on top of the reservation place_limit_*
+// already made, silently double-charging every single fill.
+// ============================================================================
+static int test_resting_fill_settlement(void) {
+    L3OrderBook *ob_base = ob_create(), *ob_opt = ob_create();
+    EngineAccount acc_base, acc_opt;
+    ob_init_baseline(ob_base, &acc_base, 100);
+    ob_init_opt(ob_opt, &acc_opt, 100);
+
+    int fails = 0;
+
+    // --- resting buy, filled by noise sell flow (is_player=0) ---
+    // Placed at base_price (100): better than the seeded best bid (99),
+    // so it's the sole order on a brand-new level and gets hit first --
+    // nothing from ob_init_* is ahead of it in the queue.
+    long cash_before = acc_base.my_cash;
+    long inv_before = acc_base.my_inventory;
+    int buy_id_base = ob_place_limit_buy_baseline(ob_base, &acc_base, 100, 10);
+    int buy_id_opt  = ob_place_limit_buy_opt(ob_opt, &acc_opt, 100, 10);
+    if (buy_id_base < 0 || buy_id_opt < 0) {
+        printf("FAIL: setup resting buy placement failed\n");
+        ob_destroy(ob_base); ob_destroy(ob_opt);
+        return 1;
+    }
+    long reserved = cash_before - acc_base.my_cash; // 10 * 100
+    // Noise sell flow walks the bids and should fill our resting buy
+    // completely (it's the sole order at the new best bid).
+    ob_market_sell_baseline(ob_base, &acc_base, 10, /*is_player=*/0);
+    ob_market_sell_opt(ob_opt, &acc_opt, 10, /*is_player=*/0);
+    if (order_live_at(ob_base, 1, 100, buy_id_base, 0) || order_live_at(ob_opt, 1, 100, buy_id_opt, 0)) {
+        printf("FAIL: resting buy wasn't fully filled by noise sell flow\n");
+        fails++;
+    }
+    // The fill must settle inventory (the unreserved leg) and leave cash
+    // exactly where the reservation left it -- not deduct the price again.
+    if (acc_base.my_cash != cash_before - reserved || acc_opt.my_cash != cash_before - reserved) {
+        printf("FAIL: resting buy fill double-charged cash (base=%ld opt=%ld, expected %ld)\n",
+               acc_base.my_cash, acc_opt.my_cash, cash_before - reserved);
+        fails++;
+    }
+    if (acc_base.my_inventory != inv_before + 10 || acc_opt.my_inventory != inv_before + 10) {
+        printf("FAIL: resting buy fill didn't credit inventory (base=%d opt=%d, expected %ld)\n",
+               acc_base.my_inventory, acc_opt.my_inventory, inv_before + 10);
+        fails++;
+    }
+
+    // --- resting sell, filled by noise buy flow (is_player=0) ---
+    // Placed at base_price (100): better than the seeded best ask (101),
+    // same reasoning as the buy above -- sole order, hit first.
+    cash_before = acc_base.my_cash;
+    inv_before = acc_base.my_inventory;
+    int sell_id_base = ob_place_limit_sell_baseline(ob_base, &acc_base, 100, 10);
+    int sell_id_opt  = ob_place_limit_sell_opt(ob_opt, &acc_opt, 100, 10);
+    if (sell_id_base < 0 || sell_id_opt < 0) {
+        printf("FAIL: setup resting sell placement failed\n");
+        ob_destroy(ob_base); ob_destroy(ob_opt);
+        return ++fails;
+    }
+    long inv_reserved = inv_before - acc_base.my_inventory; // 10, reserved at placement
+    ob_market_buy_baseline(ob_base, &acc_base, 10, /*is_player=*/0);
+    ob_market_buy_opt(ob_opt, &acc_opt, 10, /*is_player=*/0);
+    if (order_live_at(ob_base, 0, 100, sell_id_base, 0) || order_live_at(ob_opt, 0, 100, sell_id_opt, 0)) {
+        printf("FAIL: resting sell wasn't fully filled by noise buy flow\n");
+        fails++;
+    }
+    // Inventory (the reserved leg) must stay exactly where the
+    // reservation left it; cash (unreserved) gets the sale proceeds.
+    if (acc_base.my_inventory != inv_before - inv_reserved || acc_opt.my_inventory != inv_before - inv_reserved) {
+        printf("FAIL: resting sell fill double-charged inventory (base=%d opt=%d, expected %ld)\n",
+               acc_base.my_inventory, acc_opt.my_inventory, inv_before - inv_reserved);
+        fails++;
+    }
+    if (acc_base.my_cash != cash_before + (long)10 * 100 || acc_opt.my_cash != cash_before + (long)10 * 100) {
+        printf("FAIL: resting sell fill didn't credit sale proceeds (base=%ld opt=%ld, expected %ld)\n",
+               acc_base.my_cash, acc_opt.my_cash, cash_before + (long)10 * 100);
+        fails++;
+    }
+
+    if (!accounts_equal(&acc_base, &acc_opt) || !books_equal(ob_base, ob_opt)) {
+        printf("FAIL: baseline/opt diverged after resting-fill settlement\n");
+        fails++;
+    }
+
+    if (fails == 0) {
+        printf("PASS: resting order fill settles only the unreserved leg (cash for a buy fill, "
+               "inventory for a sell fill), matching what place_limit_* reserved up front, "
+               "identical on baseline and opt\n");
+    }
+    ob_destroy(ob_base); ob_destroy(ob_opt);
+    return fails;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_tick_replay();
@@ -745,6 +841,7 @@ int main(void) {
     failures += test_modify_order_lifecycle();
     failures += test_modify_random_stress();
     failures += test_any_order_cancel_reduce_lifecycle();
+    failures += test_resting_fill_settlement();
 
     if (failures == 0) {
         printf("\nALL TESTS PASSED\n");

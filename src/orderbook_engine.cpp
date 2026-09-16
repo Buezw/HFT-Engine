@@ -242,10 +242,20 @@ int reduce_qty_any_impl(L3OrderBook *ob, int order_id, int delta_qty, bool use_i
 }
 
 // Shared by both market_buy_* (walks asks) and market_sell_* (walks
-// bids) -- credit_as_buy picks which direction fills get credited in
-// (see ob_market_buy_baseline's original comment for why the sign flips
-// between is_player and !is_player&&is_mine cases: a real bug lived here
-// once, see README).
+// bids) -- credit_as_buy picks which direction fills get credited in.
+//
+// Two fill cases hit the account, and they are NOT symmetric:
+//   - is_player: the player's own aggressive market order eating resting
+//     liquidity nobody has reserved anything against yet -- apply the
+//     full fill (both legs) here.
+//   - !is_player && ord_it->is_mine: someone else's flow filling one of
+//     the player's own resting limit orders. place_limit_buy_impl/
+//     place_limit_sell_impl already reserved one leg of this trade up
+//     front (cash for a buy, inventory for a sell) -- see their comments.
+//     Touching that same leg again here would double-charge the fill, so
+//     only the leg that was NOT pre-reserved gets settled.
+// (is_player && ord_it->is_mine, the player crossing their own resting
+// order, is skipped entirely just below -- no self-trades.)
 template <typename Cmp>
 void match_against(L3OrderBook *ob, std::map<int, PriceLevel, Cmp> &levels, EngineAccount *acc,
                     int qty, int is_player, bool credit_as_buy, bool use_index) {
@@ -260,15 +270,19 @@ void match_against(L3OrderBook *ob, std::map<int, PriceLevel, Cmp> &levels, Engi
             qty -= fill;
             filled_here += fill;
 
-            if (is_player || ord_it->is_mine) {
-                int sign = is_player ? 1 : -1;
+            if (is_player) {
                 if (credit_as_buy) {
-                    acc->my_inventory += sign * fill;
-                    acc->my_cash -= sign * (long)fill * lvl.price;
+                    acc->my_inventory += fill;
+                    acc->my_cash -= (long)fill * lvl.price;
                 } else {
-                    acc->my_inventory -= sign * fill;
-                    acc->my_cash += sign * (long)fill * lvl.price;
+                    acc->my_inventory -= fill;
+                    acc->my_cash += (long)fill * lvl.price;
                 }
+                acc->total_fill_volume += fill;
+                acc->window_trade_qty += fill;
+            } else if (ord_it->is_mine) {
+                if (credit_as_buy) acc->my_cash += (long)fill * lvl.price; // resting sell: inventory was reserved at placement
+                else               acc->my_inventory += fill;             // resting buy: cash was reserved at placement
                 acc->total_fill_volume += fill;
                 acc->window_trade_qty += fill;
             }
