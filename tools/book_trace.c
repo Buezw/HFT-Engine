@@ -1,27 +1,16 @@
 // ============================================================================
 // book_trace.c
 //
-// The desktop-testable engine (src/orderbook_engine.c) has no visualization
-// at all — the only rendering that ever existed for this project is
-// board/main.c's VGA framebuffer code, which only runs on the physical
-// DE1-SoC and can't be seen without the board. Debugging or demoing anything
-// built on top of the extracted engine (market-making logic included) means
-// staring at printf("PASS")/nanosecond numbers and reasoning about book
-// state in your head.
+// Runs a fixed, reproducible scenario against the opt engine and prints
+// one JSON object per tick to stdout: full book state (every price
+// level, every order resting there, is_mine), account state, and a short
+// description of what happened that tick. `make visualize` pipes this
+// into tools/render_trace.py, which embeds it into a self-contained,
+// scrubbable HTML replay (tools/visualizer_template.html).
 //
-// This runs a fixed, reproducible scenario against the *_opt engine +
-// indexed order lifecycle, and prints one JSON object per tick to stdout:
-// full book state (every price level, every order, is_mine/state), account
-// state, and a short description of what happened that tick. `make
-// visualize` pipes this into tools/render_trace.py, which embeds it into a
-// self-contained, scrubbable HTML replay (tools/visualizer_template.html).
-//
-// Deliberately reuses the engine's public API only (ob_market_*_opt,
-// ob_place_limit_*_opt_indexed, ob_cancel_order_opt_indexed,
-// ob_drift_price_opt, ob_clean_ghosts_opt) — this is a viewer, not a
-// second implementation of anything, and it's the same harness that will
-// show whatever market-making/quoting logic gets layered on top later,
-// unchanged.
+// Deliberately reuses only the engine's public API (ob_market_*_opt,
+// ob_place_limit_*_opt, ob_cancel_order_opt, the read-only accessors) --
+// this is a viewer, not a second implementation of anything.
 // ============================================================================
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,34 +31,38 @@ static int rand_range(int lo, int hi) { // inclusive
     return lo + (int)(xorshift32() % (uint32_t)(hi - lo + 1));
 }
 
-static void print_level(const L3PriceLevel *lvl) {
-    printf("{\"price\":%d,\"total_qty\":%d,\"order_count\":%d,\"orders\":[",
-           lvl->price, lvl->total_qty, lvl->order_count);
-    for (int i = 0; i < lvl->order_count; i++) {
-        const L3Order *o = &lvl->queue[i];
+static void print_side(const L3OrderBook *ob, int is_bid) {
+    int n = ob_num_levels(ob, is_bid);
+    for (int i = 0; i < n; i++) {
         if (i) printf(",");
-        printf("{\"id\":%d,\"qty\":%d,\"is_mine\":%d,\"state\":%d}",
-               o->order_id, o->qty, o->is_mine, o->state);
+        int price = ob_level_price(ob, is_bid, i);
+        long qty = ob_level_qty(ob, is_bid, i);
+        int count = ob_level_order_count(ob, is_bid, i);
+        printf("{\"price\":%d,\"total_qty\":%ld,\"order_count\":%d,\"orders\":[",
+               price, qty, count);
+        for (int s = 0; s < count; s++) {
+            int id, oqty, mine;
+            ob_level_order_at(ob, is_bid, i, s, &id, &oqty, &mine);
+            if (s) printf(",");
+            printf("{\"id\":%d,\"qty\":%d,\"is_mine\":%d}", id, oqty, mine);
+        }
+        printf("]}");
     }
-    printf("]}");
 }
 
 static void print_tick(int tick, const L3OrderBook *ob, const EngineAccount *acc,
                         const char *event) {
     printf("{\"tick\":%d,\"event\":\"%s\",\"bids\":[", tick, event);
-    for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
-        if (i) printf(",");
-        print_level(&ob->bids[i]);
-    }
+    print_side(ob, 1);
     printf("],\"asks\":[");
-    for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
-        if (i) printf(",");
-        print_level(&ob->asks[i]);
-    }
+    print_side(ob, 0);
     // current_total_assets is never updated past ob_init_* in this engine
-    // (only board/main.c's own loop marks it to market) — compute PnL here
-    // from cash + inventory marked at the best bid instead of trusting it.
-    long pnl = acc->my_cash + (long)acc->my_inventory * ob->bids[0].price - INITIAL_CAPITAL;
+    // (only board/main.c's own loop marks it to market) -- compute PnL
+    // here from cash + inventory marked at the best bid instead of
+    // trusting it. An empty bid side (possible now that levels can
+    // actually run dry) has no price to mark against; skip marking then.
+    int best_bid = ob_level_price(ob, 1, 0);
+    long pnl = acc->my_cash + (best_bid > 0 ? (long)acc->my_inventory * best_bid : 0) - INITIAL_CAPITAL;
     printf("],\"account\":{\"cash\":%ld,\"inventory\":%d,\"pnl\":%ld,\"fill_volume\":%ld}}\n",
            acc->my_cash, acc->my_inventory, pnl, acc->total_fill_volume);
 }
@@ -93,52 +86,50 @@ static int pop_random_open(void) {
 int main(int argc, char **argv) {
     int ticks = (argc > 1) ? atoi(argv[1]) : 300;
 
-    L3OrderBook ob;
+    L3OrderBook *ob = ob_create();
     EngineAccount acc;
-    OrderIndex idx;
-    ob_init_opt(&ob, &acc, 100);
-    ob_index_init(&idx);
+    ob_init_opt(ob, &acc, 100);
 
     for (int t = 0; t < ticks; t++) {
         char event[128];
         snprintf(event, sizeof(event), "tick %d: quiet", t);
 
-        // Market-maker liquidity injection, same cadence/shape as the
-        // replay in tests/test_correctness.c.
+        // Market-maker liquidity injection at a small spread of real
+        // prices around the mid, same cadence/shape as before.
         if (t % 3 == 0) {
-            int i = t % MAX_PRICE_LEVELS;
+            int i = t % 3;
             int qb = (t * 13 + i * 7) % 40 + 10;
             int qa = (t * 17 + i * 11) % 40 + 10;
-            ob_add_order_opt(&ob.bids[i], (L3Order){acc.global_order_id++, qb, 0, 0, 0});
-            ob_add_order_opt(&ob.asks[i], (L3Order){acc.global_order_id++, qa, 0, 0, 0});
+            ob_add_order_opt(ob, /*is_bid=*/1, 99 - i, acc.global_order_id++, qb, 0);
+            ob_add_order_opt(ob, /*is_bid=*/0, 101 + i, acc.global_order_id++, qa, 0);
             snprintf(event, sizeof(event),
-                     "tick %d: market noise added liquidity at level %d", t, i);
+                     "tick %d: market noise added liquidity near %d/%d", t, 99 - i, 101 + i);
         }
 
         // Noise market orders (is_player=0) chewing into the book.
         if (t % 5 == 0) {
             int vol = rand_range(10, 30);
             if (rand_range(0, 1)) {
-                ob_market_sell_opt(&ob, &acc, vol, 0);
+                ob_market_sell_opt(ob, &acc, vol, 0);
                 snprintf(event, sizeof(event), "tick %d: market noise sold %d", t, vol);
             } else {
-                ob_market_buy_opt(&ob, &acc, vol, 0);
+                ob_market_buy_opt(ob, &acc, vol, 0);
                 snprintf(event, sizeof(event), "tick %d: market noise bought %d", t, vol);
             }
         }
 
-        // Player places a resting limit order (indexed lifecycle).
+        // Player places a resting limit order at a real price near the mid.
         if (t % 9 == 0) {
-            int lvl = rand_range(0, MAX_PRICE_LEVELS - 1);
+            int price = 95 + rand_range(0, 10);
             int qty = rand_range(5, 25);
             int id = rand_range(0, 1)
-                ? ob_place_limit_buy_opt_indexed(&ob, &acc, &idx, lvl, qty)
-                : ob_place_limit_sell_opt_indexed(&ob, &acc, &idx, lvl, qty);
+                ? ob_place_limit_buy_opt(ob, &acc, price, qty)
+                : ob_place_limit_sell_opt(ob, &acc, price, qty);
             if (id >= 0) {
                 track_open(id);
                 snprintf(event, sizeof(event),
-                         "tick %d: player placed limit order id %d (level %d, qty %d)",
-                         t, id, lvl, qty);
+                         "tick %d: player placed limit order id %d (price %d, qty %d)",
+                         t, id, price, qty);
             }
         }
 
@@ -146,7 +137,7 @@ int main(int argc, char **argv) {
         if (t % 11 == 0) {
             int id = pop_random_open();
             if (id >= 0) {
-                int ok = ob_cancel_order_opt_indexed(&ob, &acc, &idx, id);
+                int ok = ob_cancel_order_opt(ob, &acc, id);
                 snprintf(event, sizeof(event), "tick %d: player cancelled order id %d (%s)",
                          t, id, ok ? "refunded" : "already gone");
             }
@@ -156,32 +147,16 @@ int main(int argc, char **argv) {
         if (t % 13 == 0) {
             int qty = rand_range(5, 20);
             int submitted = rand_range(0, 1)
-                ? ob_market_buy_risk_checked_opt(&ob, &acc, qty)
-                : ob_market_sell_risk_checked_opt(&ob, &acc, qty);
+                ? ob_market_buy_risk_checked_opt(ob, &acc, qty)
+                : ob_market_sell_risk_checked_opt(ob, &acc, qty);
             snprintf(event, sizeof(event),
                      "tick %d: player risk-checked order requested %d, submitted %d "
                      "(inventory %d)", t, qty, submitted, acc.my_inventory);
         }
 
-        // Price drift — the market moving on its own, not in response to
-        // anything the player or the noise flow did. Small step, every
-        // few ticks, so the ladder visibly walks instead of sitting
-        // frozen at its ob_init_opt value for the whole replay.
-        if (t % 4 == 0) {
-            int delta = rand_range(0, 1) ? 1 : -1;
-            if (ob_drift_price_opt(&ob, delta)) {
-                snprintf(event, sizeof(event), "tick %d: price drifted %s%d (mid now %d)",
-                         t, delta > 0 ? "+" : "", delta, (ob.bids[0].price + ob.asks[0].price) / 2);
-            }
-        }
-
-        for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
-            ob_clean_ghosts_opt(&ob.bids[i]);
-            ob_clean_ghosts_opt(&ob.asks[i]);
-        }
-
-        print_tick(t, &ob, &acc, event);
+        print_tick(t, ob, &acc, event);
     }
 
+    ob_destroy(ob);
     return 0;
 }

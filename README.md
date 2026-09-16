@@ -19,14 +19,92 @@ engine core**, so the performance-critical logic can be validated and
 measured on a normal machine instead of only living inside a board-only
 build.
 
+The engine itself (`src/orderbook_engine.cpp`) is C++ now, not C — see
+"C++ rewrite: a dynamic order book" below for why. Everything else
+(`tests/`, `bench/`, `tools/`) stays plain C and links against it through
+a C API.
+
+## C++ rewrite: a dynamic order book
+
+For a while this engine kept the bare-metal build's original constraint
+even on the desktop port: `L3OrderBook` was a fixed-size array,
+`MAX_PRICE_LEVELS` price slots per side, no malloc. Fine for testing
+matching logic in isolation. Then real NASDAQ order flow
+([LOBSTER](https://lobsterdata.com), see below) got run through it, and
+the actual cost of that constraint showed up: once the top tracked price
+level's liquidity fully drained, the engine had no way to discover the
+real next-best price, because anything outside its narrow window was
+never recorded at all. Over one real trading day the tracked best bid
+got stuck at the opening price ($579.40) while the real market drifted
+down to $565.12 — a $14+ divergence, and it wasn't a rounding error, it
+was the engine having genuinely lost track of where the market was.
+
+The fix is the one every real matching engine already uses: don't cap
+how many price levels you track. `L3OrderBook` is now backed by
+`std::map<price, level>` per side (a level exists exactly when at least
+one order rests there — created on insert, erased when the last order
+leaves) and `std::deque<Order>` per level, with no `MAX_PRICE_LEVELS` or
+`MAX_ORDERS_PER_LVL` anywhere. `L3OrderBook` is opaque now (`ob_create`/
+`ob_destroy`, read state through accessors like `ob_level_price`/
+`ob_num_levels` instead of struct fields) so the public API in
+`include/orderbook_engine.h` stays plain C — `tests/`, `bench/`, and
+`tools/` didn't need to become C++ themselves, just update their call
+sites.
+
+**What this removed, because a dynamic book doesn't need it:**
+- **Price drift** (`ob_drift_price_*`) — existed to relabel fixed slots
+  as the market moved. A dynamic book just gets a new map key for a new
+  best price; there's nothing to relabel. (This also fixed a subtler bug
+  the drift design had: moving bid and ask together, the only option a
+  fixed ladder had, corrupts whichever side isn't actually changing the
+  moment you try to track them independently — found running real data
+  through it, before the full rewrite. See git history for
+  `ob_drift_bid_price_*`/`ob_drift_ask_price_*`, the intermediate fix
+  that was superseded by removing drift entirely.)
+- **Ghost orders + `ob_clean_ghosts_*`** — a filled/cancelled order used
+  to get marked `state=2` and linger in its fixed array slot until a
+  compaction pass ran. A `std::deque` just erases it immediately.
+- **`ob_update_total_qty_*`** — total_qty is maintained incrementally at
+  every mutation site now, for both baseline and opt; there's no
+  "rescan later" fallback because there's nothing left to rescan.
+- **The separate `OrderIndex`/`_opt_indexed` API** — opt keeps an
+  `order_id -> price` index as a normal member now, not a second parallel
+  data structure bolted on afterward.
+
+**What baseline vs opt means now:** the old split was "faithful port of
+main.c's fixed-array logic" vs "optimized." That distinction doesn't
+carry over to a dynamic structure — there's no fixed-array version left
+to be faithful to. The methodology stays (two independent
+implementations, diffed after every operation via `ob_books_equal`, so
+an optimization can never silently change behavior), just re-scoped to
+what's actually still a live algorithmic choice: **both use the same
+dynamic book**; baseline finds an order to cancel/modify by scanning
+every order in the book, opt jumps straight to the right price level via
+its index. Same idea as the old indexed-vs-linear split, just built into
+one implementation instead of two parallel APIs — and now it actually
+matters at realistic depth instead of capping out at a few hundred
+orders. The depth-sweep speedup used to top out around 2.5x at
+`MAX_ORDERS_PER_LVL=400`; run at real depth now (`make depth-sweep`), it
+passes 400x by a few thousand orders and 800x by five thousand (see
+Results below) — the old number was measuring the shape of the
+optimization, not the actual gap.
+
+Confirmed against the same real GOOG trading day that exposed the
+original bug: the tracked best bid now follows the market down to
+$565.10, two cents off the real $565.12 by end of day — the remaining
+gap is the LOBSTER message file starting at market open rather than
+from a genuinely empty book (see "LOBSTER real-market-data validation"
+below for that data-completeness caveat, which is unrelated to and
+predates this rewrite), not a tracking failure.
+
 ## Files
 
 ```
 board/main.c                 original bare-metal program (RISC-V/DE1-SoC only)
-include/orderbook_engine.h   public API + data structures for the extracted engine
-src/orderbook_engine.c       baseline + optimized implementations, limit order lifecycle, risk limit
-tests/test_correctness.c     200k-tick replay + capacity/lifecycle/stress/risk-limit tests
-bench/benchmark.c            baseline-vs-optimized timing: mean, percentiles, depth sweep
+include/orderbook_engine.h   public C API + opaque L3OrderBook, EngineAccount
+src/orderbook_engine.cpp     C++ implementation: dynamic std::map/std::deque book, baseline + opt
+tests/test_correctness.c     200k-tick replay + lifecycle/stress/risk-limit tests (plain C, links against the C++ engine)
+bench/benchmark.c            baseline-vs-optimized timing: mean, percentiles, runtime depth sweep
 tools/book_trace.c           runs a scenario against the opt engine, dumps per-tick JSON
 tools/render_trace.py        wraps the JSON trace into a self-contained HTML replay
 tools/visualizer_template.html  the replay page itself (ladder + inventory/PnL/depth charts)
@@ -38,7 +116,6 @@ tools/lobster_format.h       shared LOBSTER message-format decoding (used by the
 tools/lobster_replay.c       replays real order flow, cross-checks book state against LOBSTER ground truth
 bench/lobster_bench.c        baseline-vs-opt latency under real (not synthetic) order flow
 tests/fixtures/lobster_sample/  hand-built LOBSTER-format fixture, regression-tests the replay tool itself
-scripts/format_depth_sweep.awk  tabulates `make depth-sweep` output
 Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep / visualize / threaded-bench / lobster-test / lobster-bench / clean targets
 .github/workflows/ci.yml     runs test / bench / lobster-test / asan / tsan / cppcheck on every push/PR
 ```
@@ -48,58 +125,52 @@ Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep
   normal x86 gcc (it uses RISC-V-specific interrupt attributes and raw
   hardware addresses on purpose). Kept as a historical/reference artifact,
   not part of the buildable project.
-- `include/orderbook_engine.h` / `src/orderbook_engine.c` — the order book
-  data structures and matching logic extracted into a platform-independent
-  form, with two implementations side by side:
-  - `*_baseline` — a faithful port of the logic in `main.c`
-  - `*_opt` — an optimized version with the same external behavior
+- `include/orderbook_engine.h` / `src/orderbook_engine.cpp` — the order
+  book data structures and matching logic, extracted into a
+  platform-independent, dynamic-depth form (see "C++ rewrite" above),
+  with two implementations side by side:
+  - `*_baseline` — finds an order to cancel/modify by scanning every
+    order in the book
+  - `*_opt` — same book, same matching, but keeps an `order_id -> price`
+    index for direct lookup instead of scanning
   - plus a resting player limit-order lifecycle (`ob_place_limit_*`,
     `ob_cancel_order_*`) that completes a feature `main.c` only half-built
     (see below), a pre-trade position risk limit
-    (`ob_market_*_risk_checked_*`), an O(1) cancel-by-id index
-    (`OrderIndex`, `ob_place_limit_*_opt_indexed`,
-    `ob_cancel_order_opt_indexed`), cancel-replace order modification
-    (`ob_modify_qty_*`, `ob_modify_price_*`, `+_opt_indexed`), price
-    drift (`ob_drift_price_*`), and third-party order cancel/qty-reduce
-    (`ob_cancel_order_any_*`, `ob_reduce_order_qty_any_*`, for orders that
-    aren't the player's own — see "LOBSTER real-market-data validation"
-    below) — all new in the extracted engine, not ports of anything in
-    `main.c`.
-- `tests/test_correctness.c` — ten things, in order: (1) replays 200,000
+    (`ob_market_*_risk_checked_*`), cancel-replace order modification
+    (`ob_modify_qty_*`, `ob_modify_price_*`), and third-party order
+    cancel/qty-reduce (`ob_cancel_order_any_*`,
+    `ob_reduce_order_qty_any_*`, for orders that aren't the player's own —
+    see "LOBSTER real-market-data validation" below) — all new in the
+    extracted engine, not ports of anything in `main.c`.
+- `tests/test_correctness.c` — nine things, in order: (1) replays 200,000
   ticks of synthetic market-maker + player activity against both engines
   and asserts identical account state and book state after every tick —
-  this has to pass before any benchmark number means anything; (2) a
-  capacity regression test guarding the buffer-overflow bug described
-  below; (3) a deterministic test of the limit order lifecycle (place,
-  reserve, invalid rejection, cancel, refund, double-cancel rejection);
-  (4) a 100,000-iteration randomized stress test (fixed-seed PRNG, not
-  `rand()`, for reproducibility across platforms) mixing market orders,
-  placements, and cancels, diffing full state after every operation; (5)
-  risk-limit clipping arithmetic in isolation; (6) a 20,000-iteration
-  randomized run asserting the position limit invariant holds through
-  real matching on both engines; (7) the O(1) index's fast path, its
-  bounded fallback when a compaction stales the cache, and a 50,000-
-  iteration randomized run proving it's behaviorally identical to the
-  plain linear-scan cancel at every step; (8) cancel-replace's
-  deterministic lifecycle, a 50,000-iteration randomized run mixing
-  modify_qty/modify_price into the existing workload (baseline vs opt),
-  and a second 50,000-iteration run proving the indexed modify variants
-  match the plain whole-book-scan ones; (9) price drift's deterministic
-  case (up, down, cumulative, floor rejection) and a 50,000-iteration
-  randomized run folding drift into the full existing market/limit/
-  cancel/modify workload, not testing it in isolation; (10) third-party
-  (`is_mine=0`) order cancel/qty-reduce — confirms the existing
-  `is_mine`-gated functions correctly ignore such an order, and
+  this has to pass before any benchmark number means anything; (2)
+  confirms there's no fixed depth anymore: 500 orders at one price level,
+  and a price far outside what the old fixed 3-slot window could ever
+  represent, both just work; (3) a deterministic test of the limit order
+  lifecycle (place, reserve, invalid rejection, cancel, refund,
+  double-cancel rejection); (4) a 100,000-iteration randomized stress
+  test (fixed-seed PRNG, not `rand()`, for reproducibility across
+  platforms) mixing market orders, placements, and cancels, diffing full
+  state after every operation; (5) risk-limit clipping arithmetic in
+  isolation; (6) a 20,000-iteration randomized run asserting the position
+  limit invariant holds through real matching on both engines; (7)
+  cancel-replace's deterministic lifecycle; (8) a 50,000-iteration
+  randomized run mixing modify_qty/modify_price into the existing
+  market/limit/cancel workload; (9) third-party (`is_mine=0`) order
+  cancel/qty-reduce — confirms the existing `is_mine`-gated functions
+  correctly ignore such an order, and
   `ob_cancel_order_any_*`/`ob_reduce_order_qty_any_*` correctly find and
   mutate it (partial reduce, exact-zero-removal, reject-over-large,
   bogus-id).
 - `bench/benchmark.c` — measures baseline vs optimized under identical
   workload using `clock_gettime(CLOCK_MONOTONIC)`, reporting the mean,
-  the p50/p90/p99/p99.9 latency distribution per tick, (via
-  `make depth-sweep`) how the gap between baseline and optimized scales
-  as book depth grows past the board's real value, and dedicated
-  linear-scan-vs-indexed comparisons for both cancel and modify-qty at a
-  fixed worst-case position.
+  the p50/p90/p99/p99.9 latency distribution per tick, and (via
+  `--depth-sweep`/`make depth-sweep`) how the gap between baseline
+  (linear scan) and opt (indexed) scales as book depth grows — a runtime
+  loop now, not a recompile at different `-D` values, since there's no
+  compile-time capacity left to vary.
 - `include/spsc_ring.h` / `src/spsc_ring.c` — a lock-free single-producer/
   single-consumer ring buffer, used by `bench/threaded_bench.c` to hand
   messages from a "receiver" thread to the (still single-threaded)
@@ -293,6 +364,16 @@ performance number was trusted.
 
 ## O(1) cancel-by-id index
 
+**Superseded by the C++ rewrite** (see above): the separate `OrderIndex`/
+`ob_place_limit_*_opt_indexed`/`ob_cancel_order_opt_indexed` API this
+section describes doesn't exist anymore — `ob_cancel_order_opt` keeps
+this same index natively now, no second parallel API needed, and the
+`memcmp`/generic-function-pointer constraints below that shaped this
+design don't apply to the dynamic book. Kept as history: the reasoning
+here is exactly why baseline/opt differ the way they do today, just
+implemented more directly once those two constraints went away with the
+fixed-array struct they were about.
+
 `ob_cancel_order_opt` (above) is an honest `O(orders-in-book)` scan,
 justified by a 60-order book at the board's real depth. `make depth-sweep`
 already exists to scale `MAX_ORDERS_PER_LVL` up to 400 to see how the other
@@ -355,6 +436,14 @@ The indexed lookup's cost doesn't move with depth (~21-22 ns/call at both
 just asserted.
 
 ## Cancel-replace (order modification)
+
+**Note (post C++ rewrite):** `_opt_indexed` variants mentioned below no
+longer exist as a separate API — `ob_modify_qty_opt`/`ob_modify_price_opt`
+use the same index natively (see "C++ rewrite" above). Also, "level" is
+"price" now — `ob_modify_price_*`'s second argument is a real price, not
+an index into a fixed ladder. The behavioral story (in-place qty change
+vs cancel-old+place-new for a price move, place-new-first ordering) is
+unchanged.
 
 Every existing way to change a resting order was cancel it, then place a
 brand-new one — which is fine for actually leaving the book, but wrong for
@@ -429,82 +518,62 @@ one that's cancel-old+place-new either way.
 
 ## Results (x86_64 dev machine, see caveat below)
 
-```
-[Full tick loop, mean]
-  baseline : ~150-185 ns/tick
-  optimized: ~120-150 ns/tick
-  speedup  : ~1.2-1.3x
-
-[Full tick loop, tail latency — p50 / p99]
-  baseline : p50 ~166 ns, p99 ~221 ns
-  optimized: p50 ~134 ns, p99 ~178 ns
-  speedup  : ~1.2x at both p50 and p99 (see note below on why this
-             consistency matters)
-
-[clean_ghosts in isolation]
-  baseline : ~11-13 ns/call
-  optimized: ~10-11 ns/call
-  speedup  : ~1.08-1.22x
-
-[update_total_qty full rescan, isolated, book at max depth]
-  baseline : ~29-40 ns/call, called once per tick
-  optimized: removed from hot path entirely (0 ns/tick)
-```
-
-Run-to-run variance on a shared, non-realtime dev machine is real — hence
-the ranges above rather than a single number. `make bench` prints exact
-figures for the run you actually did; don't quote a number you haven't
-personally reproduced.
-
-**Why the p50/p99 comparison, not just the mean:** a mean can hide a
-regime where the optimized version is faster on typical ticks but has a
-worse tail (e.g. from extra branching or cache pressure introduced by the
-"optimization" itself) — exactly the failure mode that matters most for
-code with a hard per-tick budget, and exactly the kind of thing a single
-average silently launders. Here they move together (~1.2x at both p50 and
-p99), which is itself a finding worth stating: the optimization doesn't
-just win on average, it wins uniformly across the distribution, so there's
-no tail-latency regression hiding behind a better mean.
-
-**Important caveat, stated plainly rather than glossed over:** these
-absolute nanosecond numbers are from an x86_64 dev machine, not the
-DE1-SoC's RISC-V core `main.c` actually runs on — different ISA, different
-cache hierarchy, different clock speed. The *relative* speedup is the
-meaningful takeaway, since both variants ran the same instructions (modulo
-the actual algorithmic difference) on the same machine in the same run.
-
-**The honest limitation of this result — and the measurement that backs
-it up:** the book depth in this project is intentionally small
-(`MAX_PRICE_LEVELS=3`, `MAX_ORDERS_PER_LVL=10` — a deliberate design
-choice to fit VRAM/CPU budget on the FPGA board), so a per-level O(n) scan
-is only ever a scan over ~10 elements. That's the whole reason the speedup
-above is a modest 1.2-1.4x rather than an order of magnitude. That claim
-used to just be asserted; `make depth-sweep` (see below) now measures it
-by recompiling the benchmark at several depths via `-DMAX_ORDERS_PER_LVL`
-and tabulating the baseline-vs-optimized gap at each:
+**Note (post C++ rewrite):** the numbers in this section changed shape,
+not just value, because what baseline vs opt even measure changed (see
+"C++ rewrite" above). The full-tick-loop numbers below now measure pure
+add+match, which baseline and opt run through identical logic —
+`ob_market_buy/sell_*` is the same function body for both now, so opt's
+*only* extra cost there is maintaining an index it never gets to use in
+this workload. The real story moved to cancel/modify-by-id at depth,
+where that index is exactly what pays off:
 
 ```
-depth     mean_ns_base    mean_ns_opt    mean_x     p50_x     p99_x rescan_ns/call
------     ------------    -----------    ------     -----     ----- --------------
-10               208.0          150.9     1.38x     1.39x     1.48x           29.9
-25               283.5          202.5     1.40x     1.43x     1.41x           88.7
-50               421.5          285.0     1.48x     1.52x     1.47x          148.6
-100             1024.4          462.4     2.22x     2.27x     2.23x          524.4
-200             1871.6          783.9     2.39x     2.42x     2.39x          985.6
-400             3545.3         1422.9     2.49x     2.51x     2.50x         1963.6
+[Full tick loop (add + match only), mean]
+  baseline : ~150 ns/tick
+  optimized: ~210 ns/tick
+  speedup  : ~0.7x -- opt is SLOWER here, on purpose to be honest about:
+             this workload never calls cancel/modify, so opt pays its
+             index-maintenance cost with nothing to show for it. That's
+             a real, correctly-measured result, not a bug -- see below.
+
+[Cancel-by-id / modify-qty-by-id, baseline (scan) vs opt (indexed), by depth]
+   depth  cancel_base_ns  cancel_opt_ns  speedup | modify_base_ns  modify_opt_ns  speedup
+      10           361.2          266.2   1.36x  |         121.7           40.3    3.02x
+      50           494.4          137.0   3.61x  |         371.6           43.7    8.51x
+     100          1002.9          133.6   7.51x  |         748.4           50.4   14.86x
+     500          5358.7          157.0  34.14x  |        4728.1           57.9   81.60x
+    2000         38848.4          196.6 197.64x  |       19601.7           75.8  258.49x
+    5000        121409.1          288.1 421.47x  |      139681.6          168.4  829.44x
 ```
 
-At the board's real depth (10), the optimization is worth 1.38x. At 40x
-that depth, it's worth 2.49x — nearly double the speedup, tracking the
-`O(n)` rescan cost (`rescan_ns/call`) scaling roughly linearly with `n`
-(10→400 is 40x depth, ~29.9ns→~1964ns is ~66x rescan cost — slightly
-superlinear, plausibly cache effects once a level's queue no longer fits
-comfortably in a few cache lines, not investigated further here). This is
-exactly the kind of trade-off worth stating explicitly in an interview —
-not every "obviously correct" optimization produces a dramatic number at
-small scale, a benchmark that only ran at the shipped configuration
-wouldn't have shown *why* it's modest, and now there's a table instead of
-an assertion.
+Run-to-run variance on a shared, non-realtime dev machine is real. `make
+bench` / `make depth-sweep` print exact figures for the run you actually
+did; don't quote a number you haven't personally reproduced.
+
+**Why opt is slower for the plain tick loop, stated plainly instead of
+cherry-picking the workload that flatters it:** baseline and opt now run
+the *identical* matching algorithm on the *identical* dynamic book — the
+old "unoptimized fixed array vs optimized incremental bookkeeping"
+distinction doesn't exist anymore (see "C++ rewrite"). The only thing
+opt still does differently is maintain an `order_id -> price` index on
+every insert/fill, in case a cancel or modify needs it later. A workload
+that never cancels or modifies pays that cost for nothing — which is
+exactly what the full-tick-loop number shows. This is the honest result,
+not a disappointing one: it says plainly that opt's value is
+*conditional* on actually doing id-based lookups, which the depth-sweep
+table above demonstrates directly.
+
+**The old limitation here doesn't exist anymore, and the numbers show
+it:** this section used to explain why the speedup topped out around
+1.2-2.5x — book depth was capped at `MAX_ORDERS_PER_LVL=10` (400 at the
+deepest synthetic sweep), a deliberate FPGA-board memory constraint, so a
+linear scan was only ever a scan over a handful of elements. With no
+cap left, the depth-sweep table above runs a real linear scan against a
+real index at depths up to 5,000 orders, and the gap is no longer subtle:
+1.36x at depth 10 (same ballpark as before, for the same reason — a scan
+over 10 elements is cheap either way), climbing past **400x** by 2,000
+orders and **800x** on modify by 5,000. The board's real depth was never
+going to produce a dramatic number; real order-book depth does.
 
 ## Trace visualizer
 
@@ -515,33 +584,44 @@ numbers, no way to actually see book state, fills, or account state change
 over time. `make visualize` fixes that:
 
 - `tools/book_trace.c` runs a fixed, reproducible 300-tick scenario (market
-  noise liquidity + noise market orders, player limit placements/cancels via
-  the indexed lifecycle, player risk-checked market orders, price drift —
-  the same public API used everywhere else in this project, not a second
-  implementation of anything) against `*_opt`, and prints one JSON object
-  per tick to stdout: every price level, every order (id, qty, `is_mine`,
-  ghost state), and account state.
+  noise liquidity + noise market orders, player limit placements/cancels,
+  player risk-checked market orders — the same public API used everywhere
+  else in this project, not a second implementation of anything) against
+  `*_opt`, and prints one JSON object per tick to stdout: every price
+  level, every order (id, qty, `is_mine`), and account state.
 - `tools/render_trace.py` embeds that JSON into `tools/visualizer_template.html`,
   producing `build/book_visualizer.html` — self-contained, no server, just
   open it in a browser. Scrub or play through the 300 ticks; the ladder
-  highlights `is_mine` orders (yellow) and ghost/pending-cleanup orders
-  (dimmed), and side panel charts track inventory, PnL, and bid/ask depth
-  over time.
+  highlights `is_mine` orders (yellow), and side panel charts track
+  inventory, PnL, and bid/ask depth over time.
 
 **A finding this made obvious that wasn't obvious from code alone:** at
 the time this was first built, price levels were set once in `ob_init_*`
 and never moved again — nothing in the engine repriced a level. Watching
 the replay, only *quantities* moved; the ladder's price column sat frozen
 for all 300 ticks. That's invisible reading `ob_market_buy_opt` in
-isolation (it only ever fills against whatever `lvl->price` already is),
+isolation (it only ever fills against whatever level price already is),
 but it mattered a lot for building a market maker on top of this engine:
 there was no fair-value drift, no adverse selection, nothing to hedge
 against, and no notion of "the market moved against you" — the primary
-risk a real market maker manages. **That gap is what motivated
-`ob_drift_price_*`, documented below** — the replay linked above already
-reflects the fix; the ladder now visibly walks instead of sitting still.
+risk a real market maker manages. **That gap motivated `ob_drift_price_*`**
+(see below) at the time — since superseded by the C++ rewrite's dynamic
+book, where price movement is a natural consequence of real order flow
+(a level disappears when its last order leaves, a new one appears
+wherever the next order names), not a primitive the engine needs to
+provide separately.
 
 ## Price drift
+
+**Superseded by the C++ rewrite** (see above) — `ob_drift_price_*` and
+its later `ob_drift_bid_price_*`/`ob_drift_ask_price_*` split don't exist
+anymore. A fixed-slot book needed an explicit primitive to relabel where
+its slots sat as the market moved; a dynamic book doesn't, since a new
+best price is just a new map key. Kept below as history: the finding
+that motivated this (frozen prices → no adverse-selection risk) is still
+true of what the fixed-array engine looked like at the time, and the
+"honest limitation" paragraph is exactly the shape of bug that pushed
+toward the eventual rewrite rather than another patch on the same model.
 
 The finding above (frozen prices → no adverse-selection risk → inventory
 skew has nothing real to defend against) came from actually watching the
@@ -549,38 +629,25 @@ engine run, and pointed at a real gap: worth fixing in the engine itself,
 since price is a property of the book, not of whatever strategy sits on
 top of it.
 
-`ob_drift_price_baseline` / `ob_drift_price_opt` shift every level's price
-by the same `delta` (bids and asks together, so the spread and level
-spacing `ob_init_*` established never change — only where the whole
-ladder sits). It's a primitive, not a policy: it doesn't decide *when* or
-*how much* to drift — same as nothing in this engine decides when a
-market order arrives. `tools/book_trace.c`'s scenario now calls it every 4
-ticks with a ±1 step, which is enough on its own to visibly walk the mid
-from 101 down to 93 over a 300-tick replay (rerun `make visualize` to see
-the exact path — it's a random walk, not scripted to hit that number).
+`ob_drift_price_baseline` / `ob_drift_price_opt` shifted every level's
+price by the same `delta` (bids and asks together, so the spread and
+level spacing `ob_init_*` established never changed — only where the
+whole ladder sat). A primitive, not a policy: it didn't decide *when* or
+*how much* to drift.
 
-**Honest limitation, not glossed over:** this engine has exactly
-`MAX_PRICE_LEVELS` fixed slots per side, unlike a real order book where
-levels are created and destroyed as orders arrive at whatever price they
-name. Drifting is therefore a relabeling of what those fixed slots' price
-tags are, not a simulation of new levels appearing — which means an order
-resting in a level when it drifts gets, in effect, repriced along with
-it: `ob_market_buy_opt`/`sell_opt` charge `(long)fill * lvl->price` using
-whatever the level's *current* price is at fill time, not whatever price
-was in effect when the order was placed. A faithful multi-level book
-wouldn't do this; this one does, as a direct consequence of the
-fixed-slot model everything else here is already built on, not a new bug
-introduced by this feature.
-
-Tested the same way as everything else: a deterministic case (an ordinary
-upward drift, an ordinary downward drift, the cumulative effect of both,
-and a large downward drift that must be rejected outright at `MIN_PRICE`
-with zero state mutated), identical on baseline and opt; and a
-50,000-iteration randomized run that folds drift into the *existing*
-market/limit/cancel/modify_qty/modify_price workload rather than testing
-it in isolation — the point being to prove drift composes safely with
-every other operation this file already exercises, not just that it works
-on its own. Clean under `make asan`.
+**Honest limitation, not glossed over — and the one that eventually
+motivated removing this instead of patching it further:** the engine had
+exactly `MAX_PRICE_LEVELS` fixed slots per side, unlike a real order book
+where levels are created and destroyed as orders arrive at whatever price
+they name. Drifting was therefore a relabeling of what those fixed slots'
+price tags were, not a simulation of new levels appearing — which meant
+an order resting in a level when it drifted got, in effect, repriced
+along with it. Independently drifting bid and ask (attempted once, to
+track real LOBSTER order flow — see git history for
+`ob_drift_bid_price_*`/`ob_drift_ask_price_*`) turned out to corrupt
+whichever side wasn't actually changing, since the two were fundamentally
+glued together by the fixed-slot model. That's what finally motivated the
+rewrite instead of another fix on the same foundation.
 
 ## A fill-direction bug — found by a downstream project's test, not this repo's own
 
@@ -647,6 +714,12 @@ linear-scan numbers (re-measured at 6 depths, not just the two points
 quoted elsewhere in this README). Open it directly in a browser — no
 `make` target, nothing to generate, it's just a file.
 
+**Stale as of the C++ rewrite** (see above) — it still describes the
+pre-rewrite API (`ob_drift_price_*`, `ob_cancel_order_opt_indexed`,
+level-index placement) and hasn't been regenerated for the current
+function list yet. Cross-check against `include/orderbook_engine.h`
+until it's updated.
+
 ## LOBSTER real-market-data validation
 
 Every correctness result above comes from one engine checked against
@@ -672,7 +745,7 @@ checking them, to see whether real inter-arrival timing and order-size
 distributions change the p99/p99.9 tail latency the synthetic
 `depth-sweep` table above reports.
 
-**Two real gaps this surfaced in the existing API**, both fixed with pure
+**Two real gaps this surfaced in the engine API**, both fixed with pure
 additions (nothing already-tested changed):
 
 - `ob_cancel_order_opt`/`ob_modify_qty_opt` only ever touch `is_mine==1`
@@ -681,54 +754,66 @@ additions (nothing already-tested changed):
   target orders belonging to anonymous third parties, injected via
   `ob_add_order_*` the same way market-maker/noise liquidity always has
   been — and until now, nothing could cancel or reduce those by id.
-  `ob_cancel_order_any_*`/`ob_reduce_order_qty_any_*` (same file, right
-  after the functions they mirror) do exactly that, minus the `is_mine`
-  filter and the refund, with their own differential test coverage.
-- `MAX_PRICE_LEVELS` was hardcoded at 3, unlike `MAX_ORDERS_PER_LVL`,
-  which `make depth-sweep` already overrides at compile time. It's now
-  the same kind of build-time knob (`-DMAX_PRICE_LEVELS=N`), so a replay
-  can be validated at whatever depth the downloaded LOBSTER sample
-  actually has. Confirmed safe before changing it: every loop bound and
-  array access across `src/`, `tests/`, and `bench/` already referenced
-  the macro symbolically — grep found zero hardcoded `3`s standing in
-  for it, so this was a one-line change, not a refactor.
+  `ob_cancel_order_any_*`/`ob_reduce_order_qty_any_*` do exactly that,
+  minus the `is_mine` filter and the refund, with their own differential
+  test coverage.
+- `MAX_PRICE_LEVELS` being hardcoded at all turned out to be a much
+  bigger problem than expected: making it a build-time knob (an
+  intermediate fix, since superseded) wasn't enough, because the real
+  issue wasn't the *number* of tracked levels, it was that a fixed window
+  can't discover a real price outside it once the level it's currently
+  tracking drains dry. Running this same real GOOG data through the
+  fixed-array engine is what actually motivated the full C++ rewrite
+  documented above — see that section for the concrete before/after.
 
-**A representational mismatch worth understanding before trusting any
-comparison output**: this engine has `MAX_PRICE_LEVELS` fixed *ticks* per
-side, always exactly one tick apart — `ob_drift_price_*` relabels where
-the whole ladder sits, but never changes that spacing. LOBSTER's
-orderbook file instead lists `MAX_PRICE_LEVELS` *populated* price levels,
-which can be many ticks apart if the book has gaps. Comparing "engine
-slot `i`" straight against "LOBSTER column `i`" would report false
-mismatches every time the real book has a gap inside the compared range.
-`lobster_replay.c`'s `compare_side()` instead reconstructs a dense
-per-tick view from LOBSTER's sparse listed levels first (a tick between
-two listed prices is genuinely empty — LOBSTER only lists a level with at
-least one resting order) and compares that, tick for tick, against the
-engine's fixed slots.
+**Ground truth comparison is a direct lookup now, not a reconstruction:**
+the old fixed-array engine only tracked a few price *ticks* around the
+current best, always exactly one tick apart, while LOBSTER's orderbook
+file lists *populated* price levels, which can be many ticks apart —
+comparing "engine slot `i`" against "LOBSTER column `i`" would report
+false mismatches whenever the real book had a gap, so `compare_side()`
+used to reconstruct a dense per-tick view before comparing. Since the
+rewrite, the engine only ever represents populated prices too (a level
+exists exactly when an order rests there, same as LOBSTER's own
+representation) — so `compare_side()` now just checks the engine's
+tracked best against LOBSTER's reported best, then looks up
+`ob_qty_at_price()` at each price LOBSTER actually reported. No
+reconstruction needed because there's no representational gap left to
+bridge.
 
-**Status, honestly**: this sandbox couldn't reach LOBSTER's actual sample
-downloads to validate against a real trading day — the site is now a
-JS-rendered SPA whose real download API isn't reachable by a static
-fetch, and no working browser automation was available at the time this
-was built. `tests/fixtures/lobster_sample/` is a small, hand-constructed
-fixture in LOBSTER's documented format instead (see its README) that
-exercises every message type this adapter has to translate, including a
-submission that improves the best (drift), a same-timestamp multi-level
-execution sweep, and a trading halt marker — `make lobster-test` runs
-against it by default and is wired into CI. Running against a real
-sample is one command once you have one:
+**Status, with a real result**: `data/lobster/` holds one real trading
+day (GOOG, 2012-06-21, level-5 depth, ~112,700 messages) run through
+`make lobster-test`. It's what caught the fixed-window bug in the first
+place — tracked best bid frozen at the $579.40 opening price all day
+against a real market that closed near $565.12 — and it's what confirms
+the rewrite fixed it: same file, same day, tracked best bid now follows
+the market down to $565.10, two cents off by the close. The remaining
+gap, and the bulk of the mismatches `make lobster-test` still reports on
+this file, is a genuine, unfixable data-completeness limit: LOBSTER's
+message file starts exactly at market open, not from an empty book — the
+opening auction leaves real resting orders this replay never saw
+submitted (`refs to pre-window orders` in the summary), and any book
+comparison touching that residual liquidity will legitimately disagree
+with ground truth for as long as it's outstanding. That's a property of
+where the data window starts, not a bug in this engine or this replay.
+`tests/fixtures/lobster_sample/` (a small hand-built fixture covering
+every message type, see its own README) is what `make lobster-test` runs
+by default and what's wired into CI, precisely because it doesn't have
+this real-world gap — it's a regression test for the replay tool itself,
+not a substitute for real-data validation.
 
 ```bash
 make lobster-test  LOBSTER_MSG=data/lobster/TICKER_message.csv \
-                    LOBSTER_BOOK=data/lobster/TICKER_orderbook.csv \
-                    LOBSTER_TICK=100 LOBSTER_LEVELS=10
-make lobster-bench  LOBSTER_MSG=data/lobster/TICKER_message.csv LOBSTER_TICK=100
+                    LOBSTER_BOOK=data/lobster/TICKER_orderbook.csv
+make lobster-bench  LOBSTER_MSG=data/lobster/TICKER_message.csv
 ```
-(`LOBSTER_TICK` is LOBSTER's price units per tick — 100 for a $0.01 tick
-in most large-cap samples, but confirm against the specific ticker's data
-rather than assuming; `data/lobster/` is gitignored, real market data
-shouldn't be committed.)
+(No tick-size or depth flags needed anymore — LOBSTER prices go straight
+into the engine, see "C++ rewrite" above. `data/lobster/` is gitignored,
+real market data shouldn't be committed. The default `max_mismatches=5`
+cap will trip almost immediately on real data because of the pre-window
+gap above — pass a much larger value, e.g. `./build/lobster_replay
+<msg> <book> 100000`, to run a full real day to completion instead of
+aborting early.)
 
 ## Threaded ingestion: does splitting receive from matching actually help?
 
@@ -815,12 +900,12 @@ technique backfires, with the data to back it up.
 ## How to run it yourself
 
 ```bash
-make test         # build + run the replay, capacity, lifecycle, stress, and spsc_ring tests
+make test         # build + run the replay, lifecycle, stress, and spsc_ring tests
 make bench        # runs `make test` first, then builds + runs the benchmark
-make asan         # rebuild the tests with clang -fsanitize=address,undefined and run them
+make asan         # rebuild the tests with clang(++) -fsanitize=address,undefined and run them
 make tsan         # rebuild test_spsc_ring with clang -fsanitize=thread and run it
-make cppcheck     # static analysis over src/, bench/, tests/
-make depth-sweep  # ~35s: the table in the Results section above, regenerated live
+make cppcheck     # static analysis over the engine (C++17) plus bench/tests/tools (C)
+make depth-sweep  # ~40s: the cancel/modify-by-id table in the Results section above, regenerated live
 make visualize    # builds build/book_visualizer.html — open it in a browser
 open tools/capability_map.html  # static reference, no build step, no code reading
 make threaded-bench  # the receive/match threading comparison above, regenerated live
@@ -829,14 +914,16 @@ make lobster-bench   # real-order-flow latency benchmark, same LOBSTER_* overrid
 make clean        # remove build/
 ```
 
-`bench/benchmark.c` and `tests/test_correctness.c` can also be built
-directly if you don't want to use the Makefile:
+The engine is C++ now, so `test_correctness`/`benchmark`/every other
+target links a C file against a C++-compiled object — the Makefile does
+this as two compile steps (`gcc`/`cc` for the `.c` file, `g++` for
+`orderbook_engine.cpp`) plus a `g++`-driven link so `libstdc++` resolves.
+Building anything by hand outside the Makefile needs the same two steps:
 ```bash
-gcc -O2 -Wall -Wextra -Iinclude -o test_correctness tests/test_correctness.c src/orderbook_engine.c
+g++ -O2 -Wall -Wextra -std=c++17 -Iinclude -c src/orderbook_engine.cpp -o orderbook_engine.o
+gcc -O2 -Wall -Wextra -Iinclude -c tests/test_correctness.c -o test_correctness.o
+g++ -o test_correctness test_correctness.o orderbook_engine.o
 ./test_correctness
-
-gcc -O2 -Wall -Wextra -Iinclude -o benchmark bench/benchmark.c src/orderbook_engine.c
-./benchmark
 ```
 
 CI (`.github/workflows/ci.yml`) runs `test`/`bench`/`lobster-test`/`asan`/
@@ -949,6 +1036,35 @@ A useful narrative arc, in order:
    buffer-overflow bug above, because that one *did* get caught by a
    sanitizer eventually; this one could only ever have been caught by
    something checking real-world correctness, not internal consistency.
+
+10. **What running real market data found that no synthetic test or
+    external-reference check could have**: point 9's lesson was "internal
+    consistency isn't correctness — you need an external reference."
+    Replaying a real NASDAQ trading day (LOBSTER, GOOG, 2012-06-21)
+    against this engine's own reconstructed order book *was* exactly that
+    external reference, and it still took real data to expose the
+    problem: the engine's fixed `MAX_PRICE_LEVELS` window meant that once
+    the top tracked price fully drained, the engine had no way to
+    discover the real next-best price — anything outside its narrow
+    window was never recorded to begin with. By end of day the tracked
+    best bid was frozen at the $579.40 open while the real market had
+    moved to $565.12. No synthetic workload would ever surface this,
+    because a synthetic generator only ever produces activity *within*
+    whatever window you told it to use — the bug is specifically about
+    activity *outside* the window the code can see, which by construction
+    a hand-rolled test workload never generates. The fix wasn't a patch:
+    it was rewriting the core in C++ around a dynamic `std::map`/
+    `std::deque` book with no fixed depth at all — a bigger, riskier
+    change than anything else in this project's history, verified the
+    same way everything else here was (baseline/opt differential testing,
+    ASan/UBSan, then the *same* real GOOG day rerun to confirm the
+    tracked price now follows the market to within two cents by close).
+    The honest framing for an interview: real-world validation doesn't
+    just catch bugs synthetic tests miss, it can reveal that a whole
+    design assumption — "a small fixed window is good enough" — was
+    wrong, and knowing when a finding calls for a rewrite instead of
+    another patch on the same foundation is itself a judgment call worth
+    being able to defend.
 
 This is a much stronger story than "I built a project" — it demonstrates
 the actual discipline (verify before trusting, measure before claiming,

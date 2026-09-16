@@ -1,37 +1,34 @@
 // ============================================================================
 // benchmark.c
 //
-// Measures wall-clock time for the baseline vs optimized engine under the
-// identical synthetic workload used in test_correctness.c, using
-// clock_gettime(CLOCK_MONOTONIC) for nanosecond-resolution timing.
+// Measures wall-clock time for baseline vs opt under the same synthetic
+// workload test_correctness.c uses, using clock_gettime(CLOCK_MONOTONIC).
 //
-// Reports:
-//   - total time for N ticks
-//   - average ns/tick, plus p50/p90/p99/max ns/tick (tail latency matters
-//     more than the mean for anything that has to run inside a hard
-//     per-tick budget — a 1.3x-better average is a different claim than a
-//     1.3x-better p99, and only one of them is what a jittery outlier tick
-//     would actually cost you)
-//   - average ns/clean_ghosts call (isolated, since that's one of the two
-//     targeted optimizations)
+// Reports total/mean and p50/p90/p99/p99.9/max ns/tick for the full
+// per-tick loop, then isolates cancel-by-id and modify-qty-by-id at
+// several book depths -- that's the one real algorithmic difference left
+// between baseline and opt now that both run on the same dynamic
+// std::map/std::deque book (see orderbook_engine.h): baseline does a
+// full linear scan across every order in the book to find one by id;
+// opt keeps an order_id -> price index and jumps straight to the right
+// level. `make depth-sweep` (`--depth-sweep` here) runs just that part,
+// at several depths, to show the gap actually widening with depth --
+// this used to require recompiling at different -DMAX_ORDERS_PER_LVL
+// values; now it's a runtime loop, since there's no compile-time
+// capacity left to vary.
 //
 // NOTE ON REPRESENTATIVENESS: this runs on an x86_64 dev machine, not the
-// DE1-SoC's RISC-V core, so absolute ns numbers here are NOT the numbers
-// you'd see on the actual board (different ISA, no cache hierarchy of that
-// exact shape, different clock speed). What IS representative is the
-// *relative* speedup between baseline and optimized, since both run the
-// same instructions modulo the actual algorithmic difference, on the same
-// machine, in the same run. Report the ratio, not the absolute ns, when
-// talking about what this proves for the bare-metal target.
+// DE1-SoC's RISC-V core the engine originally targeted, so absolute ns
+// numbers aren't what you'd see there. The *relative* speedup is the
+// meaningful number to carry over.
 // ============================================================================
 
-// clock_gettime/CLOCK_MONOTONIC are POSIX, not ISO C — invisible under
-// strict -std=c11 without this feature-test macro (must be defined before
-// any system header is included, hence its position here).
+// clock_gettime/CLOCK_MONOTONIC are POSIX, not ISO C.
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include "orderbook_engine.h"
 
@@ -54,88 +51,155 @@ static long long percentile(const long long *sorted_samples, int n, double p) {
     return sorted_samples[idx];
 }
 
-// Runs the same synthetic per-tick workload as test_correctness.c against
-// whichever function pointers are passed in, and returns total elapsed ns.
-typedef int  (*add_fn)(L3PriceLevel *, L3Order);
-typedef void (*clean_fn)(L3PriceLevel *);
-typedef void (*update_fn)(L3OrderBook *);
-typedef void (*buy_fn)(L3OrderBook *, EngineAccount *, int, int);
+typedef void (*init_fn)(L3OrderBook *, EngineAccount *, int);
+typedef int  (*add_fn) (L3OrderBook *, int, int, int, int, int);
+typedef void (*buy_fn) (L3OrderBook *, EngineAccount *, int, int);
 typedef void (*sell_fn)(L3OrderBook *, EngineAccount *, int, int);
 
 // tick_ns_out, if non-NULL, must point to an array of at least `ticks`
 // long longs; run_ticks fills it with the wall-clock cost of each
 // individual tick, for percentile reporting in main().
-static long long run_ticks(int ticks,
-                            add_fn add, clean_fn clean, update_fn update,
-                            buy_fn buy, sell_fn sell,
-                            int call_update_every_tick,
-                            long long *out_clean_ns, long *out_clean_calls,
+static long long run_ticks(int ticks, init_fn init, add_fn add, buy_fn buy, sell_fn sell,
                             long long *tick_ns_out) {
-    L3OrderBook ob;
+    L3OrderBook *ob = ob_create();
     EngineAccount acc;
-    if (update == ob_update_total_qty_baseline) {
-        ob_init_baseline(&ob, &acc, 100);
-    } else {
-        ob_init_opt(&ob, &acc, 100);
-    }
-
-    long long clean_ns_total = 0;
-    long clean_calls = 0;
+    init(ob, &acc, 100);
 
     long long t0 = now_ns();
     for (int t = 0; t < ticks; t++) {
         long long tick_start = tick_ns_out ? now_ns() : 0;
 
         if (t % 2 == 0) {
-            for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
-                int q = (t * 13 + i * 7) % 40 + 10;
-                add(&ob.bids[i], (L3Order){acc.global_order_id++, q, 0, 0, 1});
-                q = (t * 17 + i * 11) % 40 + 10;
-                add(&ob.asks[i], (L3Order){acc.global_order_id++, q, 0, 0, 1});
-            }
+            int q = (t * 13) % 40 + 10;
+            add(ob, 1, 99, acc.global_order_id++, q, 0);
+            q = (t * 17) % 40 + 10;
+            add(ob, 0, 101, acc.global_order_id++, q, 0);
         }
 
-        int vol = 40;
-        if ((t * 11) % 100 < 45) sell(&ob, &acc, vol, 0);
-        else                     buy(&ob, &acc, vol, 0);
+        // Same balance test_correctness.c settled on: injection above
+        // averages ~30/side every other tick, so consumption needs to be
+        // in the same ballpark or the book just grows without bound
+        // (there's no fixed capacity anymore to silently cap it for you).
+        int vol = 100;
+        if ((t * 11) % 100 < 45) sell(ob, &acc, vol, 0);
+        else                     buy(ob, &acc, vol, 0);
 
         if (t % 7 == 0) {
-            if (t % 14 == 0) buy(&ob, &acc, 15, 1);
-            else             sell(&ob, &acc, 15, 1);
+            if (t % 14 == 0) buy(ob, &acc, 15, 1);
+            else             sell(ob, &acc, 15, 1);
         }
-
-        long long c0 = now_ns();
-        for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
-            clean(&ob.bids[i]);
-            clean(&ob.asks[i]);
-        }
-        clean_ns_total += now_ns() - c0;
-        clean_calls += 2 * MAX_PRICE_LEVELS;
-
-        if (call_update_every_tick) update(&ob);
 
         if (tick_ns_out) tick_ns_out[t] = now_ns() - tick_start;
     }
     long long t1 = now_ns();
-
-    *out_clean_ns = clean_ns_total;
-    *out_clean_calls = clean_calls;
+    ob_destroy(ob);
     return t1 - t0;
 }
 
-int main(void) {
+// Builds a book with `depth` distinct one-order bid levels (is_mine=0,
+// so cancel/modify has to skip past all of them) plus one is_mine=1
+// target order resting on the ask side -- the worst case for a linear
+// scan that checks bids before asks, and the case an id-indexed lookup
+// doesn't care about at all. Returns the target order's id.
+static int build_worst_case(L3OrderBook *ob, EngineAccount *acc, add_fn add,
+                             int (*place_sell)(L3OrderBook *, EngineAccount *, int, int),
+                             int depth, int target_qty) {
+    for (int i = 0; i < depth; i++) {
+        add(ob, /*is_bid=*/1, 1000 + i, 500000 + i, 5, /*is_mine=*/0);
+    }
+    acc->my_inventory = 1000000; // enough to place the target sell regardless of depth
+    return place_sell(ob, acc, 2000000, target_qty);
+}
+
+// cancel rebuilds the whole depth-`d` book every call (cancelling erases
+// the target); modify doesn't need to, so the two get their own call
+// counts and their own loops rather than sharing one.
+static void time_cancel(int depth, int calls, long long *base_ns, long long *opt_ns) {
+    *base_ns = 0;
+    *opt_ns = 0;
+    for (int i = 0; i < calls; i++) {
+        // Destroy + recreate each iteration rather than cancelling the
+        // depth liquidity back out order by order -- clearing it with
+        // ob_cancel_order_any_* would be O(depth) per cancel (same
+        // linear scan this benchmark exists to measure), making teardown
+        // alone O(depth^2) across all `calls` iterations. Rebuilding from
+        // scratch is O(depth) per iteration, full stop.
+        L3OrderBook *ob_base = ob_create(), *ob_opt = ob_create();
+        EngineAccount acc_base, acc_opt;
+        ob_init_baseline(ob_base, &acc_base, 100);
+        ob_init_opt(ob_opt, &acc_opt, 100);
+        int id_base = build_worst_case(ob_base, &acc_base, ob_add_order_baseline, ob_place_limit_sell_baseline, depth, 1);
+        int id_opt  = build_worst_case(ob_opt,  &acc_opt,  ob_add_order_opt,      ob_place_limit_sell_opt,      depth, 1);
+        long long t0 = now_ns();
+        ob_cancel_order_baseline(ob_base, &acc_base, id_base);
+        *base_ns += now_ns() - t0;
+        t0 = now_ns();
+        ob_cancel_order_opt(ob_opt, &acc_opt, id_opt);
+        *opt_ns += now_ns() - t0;
+        ob_destroy(ob_base);
+        ob_destroy(ob_opt);
+    }
+}
+
+static void time_modify(int depth, int calls, long long *base_ns, long long *opt_ns) {
+    L3OrderBook *ob_base = ob_create(), *ob_opt = ob_create();
+    EngineAccount acc_base, acc_opt;
+    ob_init_baseline(ob_base, &acc_base, 100);
+    ob_init_opt(ob_opt, &acc_opt, 100);
+
+    int id_base = build_worst_case(ob_base, &acc_base, ob_add_order_baseline, ob_place_limit_sell_baseline, depth, 5);
+    int id_opt  = build_worst_case(ob_opt,  &acc_opt,  ob_add_order_opt,      ob_place_limit_sell_opt,      depth, 5);
+    *base_ns = 0;
+    *opt_ns = 0;
+    for (int i = 0; i < calls; i++) {
+        int new_qty = (i % 2 == 0) ? 6 : 5; // small alternation: stays live, no rejection risk
+        long long t0 = now_ns();
+        ob_modify_qty_baseline(ob_base, &acc_base, id_base, new_qty);
+        *base_ns += now_ns() - t0;
+        t0 = now_ns();
+        ob_modify_qty_opt(ob_opt, &acc_opt, id_opt, new_qty);
+        *opt_ns += now_ns() - t0;
+    }
+    ob_destroy(ob_base);
+    ob_destroy(ob_opt);
+}
+
+static void run_depth_sweep(void) {
+    const int DEPTHS[] = {10, 50, 100, 500, 2000, 5000};
+    const int N_DEPTHS = (int)(sizeof(DEPTHS) / sizeof(DEPTHS[0]));
+    const int CALLS_CANCEL = 2000;
+    const int CALLS_MODIFY = 200000;
+
+    printf("=== Depth sweep: cancel-by-id / modify-qty-by-id, baseline (linear scan) vs opt (indexed) ===\n\n");
+    printf("%8s %14s %14s %10s | %14s %14s %10s\n",
+           "depth", "cancel_base_ns", "cancel_opt_ns", "speedup", "modify_base_ns", "modify_opt_ns", "speedup");
+    for (int d = 0; d < N_DEPTHS; d++) {
+        long long cb, co, mb, mo;
+        time_cancel(DEPTHS[d], CALLS_CANCEL, &cb, &co);
+        time_modify(DEPTHS[d], CALLS_MODIFY, &mb, &mo);
+        double cancel_base_per = (double)cb / CALLS_CANCEL, cancel_opt_per = (double)co / CALLS_CANCEL;
+        double modify_base_per = (double)mb / CALLS_MODIFY, modify_opt_per = (double)mo / CALLS_MODIFY;
+        printf("%8d %14.1f %14.1f %9.2fx | %14.1f %14.1f %9.2fx\n",
+               DEPTHS[d], cancel_base_per, cancel_opt_per, cancel_base_per / cancel_opt_per,
+               modify_base_per, modify_opt_per, modify_base_per / modify_opt_per);
+    }
+    printf("\n(depth = distinct bid levels the target order has to be scanned past;\n"
+           " baseline's cost should grow with depth, opt's shouldn't -- that's the\n"
+           " whole point of keeping an id index instead of a linear scan)\n");
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--depth-sweep") == 0) {
+        run_depth_sweep();
+        return 0;
+    }
+
     const int TICKS = 2000000;
     const int WARMUP = 200000;
 
-    long long clean_ns; long clean_calls;
-
     // Warm up (page faults, branch predictor, etc.) before the real measurement.
-    run_ticks(WARMUP, ob_add_order_baseline, ob_clean_ghosts_baseline,
-              ob_update_total_qty_baseline, ob_market_buy_baseline, ob_market_sell_baseline,
-              1, &clean_ns, &clean_calls, NULL);
-    run_ticks(WARMUP, ob_add_order_opt, ob_clean_ghosts_opt,
-              ob_update_total_qty_opt, ob_market_buy_opt, ob_market_sell_opt,
-              0, &clean_ns, &clean_calls, NULL);
+    run_ticks(WARMUP, ob_init_baseline, ob_add_order_baseline, ob_market_buy_baseline, ob_market_sell_baseline, NULL);
+    run_ticks(WARMUP, ob_init_opt,      ob_add_order_opt,      ob_market_buy_opt,      ob_market_sell_opt,      NULL);
 
     long long *base_tick_ns = malloc((size_t)TICKS * sizeof(long long));
     long long *opt_tick_ns  = malloc((size_t)TICKS * sizeof(long long));
@@ -144,33 +208,18 @@ int main(void) {
         return 1;
     }
 
-    long long base_total = run_ticks(TICKS, ob_add_order_baseline, ob_clean_ghosts_baseline,
-                                      ob_update_total_qty_baseline, ob_market_buy_baseline,
-                                      ob_market_sell_baseline,
-                                      1, /* baseline calls update_total_qty every tick */
-                                      &clean_ns, &clean_calls, base_tick_ns);
-    long long base_clean_ns = clean_ns;
-    long base_clean_calls = clean_calls;
-
-    long long opt_total = run_ticks(TICKS, ob_add_order_opt, ob_clean_ghosts_opt,
-                                     ob_update_total_qty_opt, ob_market_buy_opt,
-                                     ob_market_sell_opt,
-                                     0, /* opt never needs the full rescan on the hot path */
-                                     &clean_ns, &clean_calls, opt_tick_ns);
-    long long opt_clean_ns = clean_ns;
-    long opt_clean_calls = clean_calls;
+    long long base_total = run_ticks(TICKS, ob_init_baseline, ob_add_order_baseline,
+                                      ob_market_buy_baseline, ob_market_sell_baseline, base_tick_ns);
+    long long opt_total  = run_ticks(TICKS, ob_init_opt, ob_add_order_opt,
+                                      ob_market_buy_opt, ob_market_sell_opt, opt_tick_ns);
 
     qsort(base_tick_ns, (size_t)TICKS, sizeof(long long), cmp_ll);
     qsort(opt_tick_ns,  (size_t)TICKS, sizeof(long long), cmp_ll);
 
     printf("=== Benchmark: %d ticks (synthetic market-maker + player workload) ===\n\n", TICKS);
-
-    printf("[Full tick loop, includes add/match/clean/%s]\n",
-           "update_total_qty (baseline: every tick, opt: never on hot path)");
-    printf("  baseline : %lld ns total  ->  %.1f ns/tick (mean)\n",
-           base_total, (double)base_total / TICKS);
-    printf("  optimized: %lld ns total  ->  %.1f ns/tick (mean)\n",
-           opt_total, (double)opt_total / TICKS);
+    printf("[Full tick loop: add + match]\n");
+    printf("  baseline : %lld ns total  ->  %.1f ns/tick (mean)\n", base_total, (double)base_total / TICKS);
+    printf("  optimized: %lld ns total  ->  %.1f ns/tick (mean)\n", opt_total, (double)opt_total / TICKS);
     printf("  speedup  : %.2fx (mean)\n\n", (double)base_total / (double)opt_total);
 
     long long base_p50 = percentile(base_tick_ns, TICKS, 0.50);
@@ -182,201 +231,25 @@ int main(void) {
     long long opt_p99  = percentile(opt_tick_ns, TICKS, 0.99);
     long long opt_p999 = percentile(opt_tick_ns, TICKS, 0.999);
 
-    printf("[Per-tick latency distribution, ns — mean hides tail behavior,\n");
-    printf(" so this is the number that actually matters for a hard per-tick budget]\n");
+    printf("[Per-tick latency distribution, ns]\n");
     printf("  %-12s %8s %8s %8s %8s %8s\n", "", "p50", "p90", "p99", "p99.9", "max");
     printf("  %-12s %8lld %8lld %8lld %8lld %8lld\n", "baseline",
            base_p50, base_p90, base_p99, base_p999, base_tick_ns[TICKS - 1]);
     printf("  %-12s %8lld %8lld %8lld %8lld %8lld\n", "optimized",
            opt_p50, opt_p90, opt_p99, opt_p999, opt_tick_ns[TICKS - 1]);
-    printf("  speedup at p50: %.2fx, at p99: %.2fx\n",
+    printf("  speedup at p50: %.2fx, at p99: %.2fx\n\n",
            (double)base_p50 / (double)opt_p50, (double)base_p99 / (double)opt_p99);
-    printf("  (max is a single-sample outlier — OS scheduling noise on a\n");
-    printf("   non-realtime dev machine, not signal; p99/p99.9 are the\n");
-    printf("   numbers worth trusting from this environment)\n\n");
 
     free(base_tick_ns);
     free(opt_tick_ns);
 
-    printf("[clean_ghosts only, isolated timing, %ld calls each]\n", base_clean_calls);
-    printf("  baseline : %lld ns total  ->  %.1f ns/call\n",
-           base_clean_ns, (double)base_clean_ns / base_clean_calls);
-    printf("  optimized: %lld ns total  ->  %.1f ns/call\n",
-           opt_clean_ns, (double)opt_clean_ns / opt_clean_calls);
-    printf("  speedup  : %.2fx\n\n", (double)base_clean_ns / (double)opt_clean_ns);
-
     printf("NOTE: absolute ns figures are from this x86_64 dev machine, not the\n");
     printf("DE1-SoC RISC-V core the original main.c targets. The relative speedup\n");
-    printf("is the meaningful number to carry over; see comment header in this file.\n\n");
+    printf("is the meaningful number to carry over.\n\n");
 
-    // Isolate just the cost of ob_update_total_qty_baseline's full rescan,
-    // since that (not clean_ghosts) is the optimization expected to matter
-    // most as book depth grows. Measured standalone, called once per tick,
-    // on an already-populated book.
-    {
-        L3OrderBook ob; EngineAccount acc;
-        ob_init_baseline(&ob, &acc, 100);
-        // Fill every level to MAX_ORDERS_PER_LVL so the rescan does real work.
-        for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
-            while (ob_add_order_baseline(&ob.bids[i], (L3Order){acc.global_order_id++, 25, 0, 0, 1})) {}
-            while (ob_add_order_baseline(&ob.asks[i], (L3Order){acc.global_order_id++, 25, 0, 0, 1})) {}
-        }
-        const int CALLS = 2000000;
-        long long t0 = now_ns();
-        for (int i = 0; i < CALLS; i++) ob_update_total_qty_baseline(&ob);
-        long long dt = now_ns() - t0;
-        double rescan_ns_per_call = (double)dt / CALLS;
-        printf("[Isolated cost of the full-rescan ob_update_total_qty_baseline,\n");
-        printf(" book at max depth (%d levels x %d orders each)]\n",
-               MAX_PRICE_LEVELS, MAX_ORDERS_PER_LVL);
-        printf("  %lld ns / %d calls -> %.1f ns/call\n", dt, CALLS, rescan_ns_per_call);
-        printf("  In the optimized engine this call is REMOVED from the hot\n");
-        printf("  per-tick path entirely (0 ns/tick), since total_qty is kept\n");
-        printf("  in sync incrementally by ob_market_*_opt / ob_add_order_opt.\n");
-        printf("  This is the dominant contribution to the full-tick speedup above.\n\n");
-
-        // Single machine-parseable line consumed by `make depth-sweep` (see
-        // Makefile / README): lets that target compile this file at several
-        // MAX_ORDERS_PER_LVL values and tabulate how the gap grows with
-        // depth, instead of just asserting that it does.
-        printf("SWEEP_ROW depth=%d mean_ns_base=%.1f mean_ns_opt=%.1f "
-               "p50_ns_base=%lld p50_ns_opt=%lld p99_ns_base=%lld p99_ns_opt=%lld "
-               "rescan_ns_per_call_base=%.1f\n",
-               MAX_ORDERS_PER_LVL,
-               (double)base_total / TICKS, (double)opt_total / TICKS,
-               base_p50, opt_p50, base_p99, opt_p99,
-               rescan_ns_per_call);
-    }
-
-    // Isolate the cost of ob_cancel_order_opt (whole-book linear scan) vs
-    // ob_cancel_order_opt_indexed (O(1)-amortized hashed lookup), both at
-    // the SAME worst-case position: bids/asks[0..N-2] filled to capacity
-    // with non-mine liquidity, and the order under test placed last in
-    // asks[MAX_PRICE_LEVELS-1] — the last slot find_live_mine_order's
-    // linear scan would ever reach, since it walks all bids levels before
-    // any asks level. Both variants get the identical setup, so this
-    // isolates the algorithmic difference, not a lucky/unlucky position.
-    {
-        static L3OrderBook ob_lin, ob_idx;
-        static EngineAccount acc_lin, acc_idx;
-        static OrderIndex idx; // ORDER_INDEX_CAPACITY buckets — static, not on the stack
-
-        ob_init_opt(&ob_lin, &acc_lin, 100);
-        ob_init_opt(&ob_idx, &acc_idx, 100);
-        ob_index_init(&idx);
-        // Bypass the normal "earn inventory via a market buy" path — this
-        // is a latency microbenchmark for cancel, not a test of sell-side
-        // placement rules, and both engines need enough inventory to place
-        // repeated limit sells without the risk-limit/inventory check
-        // ever getting in the way of the measurement.
-        acc_lin.my_inventory = 1000000;
-        acc_idx.my_inventory = 1000000;
-
-        for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
-            while (ob_add_order_opt(&ob_lin.bids[i], (L3Order){acc_lin.global_order_id++, 5, 0, 0, 0})) {}
-            while (ob_add_order_opt(&ob_idx.bids[i], (L3Order){acc_idx.global_order_id++, 5, 0, 0, 0})) {}
-        }
-        for (int i = 0; i < MAX_PRICE_LEVELS - 1; i++) {
-            while (ob_add_order_opt(&ob_lin.asks[i], (L3Order){acc_lin.global_order_id++, 5, 0, 0, 0})) {}
-            while (ob_add_order_opt(&ob_idx.asks[i], (L3Order){acc_idx.global_order_id++, 5, 0, 0, 0})) {}
-        }
-        int last = MAX_PRICE_LEVELS - 1;
-        while (ob_lin.asks[last].order_count < MAX_ORDERS_PER_LVL - 1) {
-            ob_add_order_opt(&ob_lin.asks[last], (L3Order){acc_lin.global_order_id++, 5, 0, 0, 0});
-            ob_add_order_opt(&ob_idx.asks[last], (L3Order){acc_idx.global_order_id++, 5, 0, 0, 0});
-        }
-
-        const int CANCEL_CALLS = 500000;
-        long long lin_ns = 0, idx_ns = 0;
-
-        for (int i = 0; i < CANCEL_CALLS; i++) {
-            int id = ob_place_limit_sell_opt(&ob_lin, &acc_lin, last, 1); // untimed setup
-            long long t0 = now_ns();
-            ob_cancel_order_opt(&ob_lin, &acc_lin, id);                  // TIMED: whole-book scan
-            lin_ns += now_ns() - t0;
-            ob_clean_ghosts_opt(&ob_lin.asks[last]);                     // untimed: reclaim the slot
-        }
-        for (int i = 0; i < CANCEL_CALLS; i++) {
-            int id = ob_place_limit_sell_opt_indexed(&ob_idx, &acc_idx, &idx, last, 1); // untimed
-            long long t0 = now_ns();
-            ob_cancel_order_opt_indexed(&ob_idx, &acc_idx, &idx, id);    // TIMED: hashed lookup
-            idx_ns += now_ns() - t0;
-            ob_clean_ghosts_opt(&ob_idx.asks[last]);                     // untimed: reclaim the slot
-        }
-
-        printf("[Cancel-by-id, worst-case position (last slot of the last ask level, "
-               "book depth %d), %d calls each]\n", MAX_ORDERS_PER_LVL, CANCEL_CALLS);
-        printf("  linear scan (ob_cancel_order_opt)        : %lld ns total -> %.1f ns/call\n",
-               lin_ns, (double)lin_ns / CANCEL_CALLS);
-        printf("  indexed     (ob_cancel_order_opt_indexed) : %lld ns total -> %.1f ns/call\n",
-               idx_ns, (double)idx_ns / CANCEL_CALLS);
-        printf("  speedup: %.2fx\n", (double)lin_ns / (double)idx_ns);
-        printf("  (at this depth the linear scan visits up to %d order slots per call; "
-               "the indexed lookup does not grow with depth)\n\n",
-               2 * MAX_PRICE_LEVELS * MAX_ORDERS_PER_LVL);
-    }
-
-    // Same worst-case-position methodology, this time for ob_modify_qty_opt
-    // (uses the same whole-book linear scan cancel does internally) vs
-    // ob_modify_qty_opt_indexed (O(1) hashed lookup) — a single resting
-    // order at the last slot of the last ask level, modified repeatedly in
-    // place rather than cancelled+replaced each time.
-    {
-        static L3OrderBook ob_lin, ob_idx;
-        static EngineAccount acc_lin, acc_idx;
-        static OrderIndex idx;
-
-        ob_init_opt(&ob_lin, &acc_lin, 100);
-        ob_init_opt(&ob_idx, &acc_idx, 100);
-        ob_index_init(&idx);
-        acc_lin.my_inventory = 1000000;
-        acc_idx.my_inventory = 1000000;
-
-        for (int i = 0; i < MAX_PRICE_LEVELS; i++) {
-            while (ob_add_order_opt(&ob_lin.bids[i], (L3Order){acc_lin.global_order_id++, 5, 0, 0, 0})) {}
-            while (ob_add_order_opt(&ob_idx.bids[i], (L3Order){acc_idx.global_order_id++, 5, 0, 0, 0})) {}
-        }
-        for (int i = 0; i < MAX_PRICE_LEVELS - 1; i++) {
-            while (ob_add_order_opt(&ob_lin.asks[i], (L3Order){acc_lin.global_order_id++, 5, 0, 0, 0})) {}
-            while (ob_add_order_opt(&ob_idx.asks[i], (L3Order){acc_idx.global_order_id++, 5, 0, 0, 0})) {}
-        }
-        int last = MAX_PRICE_LEVELS - 1;
-        while (ob_lin.asks[last].order_count < MAX_ORDERS_PER_LVL - 1) {
-            ob_add_order_opt(&ob_lin.asks[last], (L3Order){acc_lin.global_order_id++, 5, 0, 0, 0});
-            ob_add_order_opt(&ob_idx.asks[last], (L3Order){acc_idx.global_order_id++, 5, 0, 0, 0});
-        }
-        int lin_id = ob_place_limit_sell_opt(&ob_lin, &acc_lin, last, 5);
-        int idx_id = ob_place_limit_sell_opt_indexed(&ob_idx, &acc_idx, &idx, last, 5);
-
-        const int MODIFY_CALLS = 500000;
-        long long lin_ns = 0, idx_ns = 0;
-
-        for (int i = 0; i < MODIFY_CALLS; i++) {
-            int new_qty = (i % 2 == 0) ? 6 : 5; // small alternation: stays live, no rejection risk
-            long long t0 = now_ns();
-            ob_modify_qty_opt(&ob_lin, &acc_lin, lin_id, new_qty); // TIMED: whole-book scan
-            lin_ns += now_ns() - t0;
-        }
-        for (int i = 0; i < MODIFY_CALLS; i++) {
-            int new_qty = (i % 2 == 0) ? 6 : 5;
-            long long t0 = now_ns();
-            ob_modify_qty_opt_indexed(&ob_idx, &acc_idx, &idx, idx_id, new_qty); // TIMED: hashed lookup
-            idx_ns += now_ns() - t0;
-        }
-
-        printf("[Modify-qty-by-id, worst-case position (last slot of the last ask level, "
-               "book depth %d), %d calls each]\n", MAX_ORDERS_PER_LVL, MODIFY_CALLS);
-        printf("  linear scan (ob_modify_qty_opt)        : %lld ns total -> %.1f ns/call\n",
-               lin_ns, (double)lin_ns / MODIFY_CALLS);
-        printf("  indexed     (ob_modify_qty_opt_indexed) : %lld ns total -> %.1f ns/call\n",
-               idx_ns, (double)idx_ns / MODIFY_CALLS);
-        printf("  speedup: %.2fx\n", (double)lin_ns / (double)idx_ns);
-        printf("  (same story as cancel above: the indexed lookup does not grow with depth,\n"
-               "   which matters here specifically because a qty-only modify keeps its queue\n"
-               "   position — it's the operation you'd actually want to be cheap if you're\n"
-               "   repricing/resizing a resting quote often, not the price-changing kind that's\n"
-               "   cancel-old+place-new either way)\n\n");
-    }
+    printf("Run with --depth-sweep (or `make depth-sweep`) for cancel-by-id /\n");
+    printf("modify-qty-by-id timing across several book depths -- that's the\n");
+    printf("actual algorithmic difference left between baseline and opt.\n");
 
     return 0;
 }

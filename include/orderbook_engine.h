@@ -1,73 +1,37 @@
 // ============================================================================
 // orderbook_engine.h
 //
-// Platform-independent core of the L3 matching engine originally written for
-// bare-metal RISC-V (DE1-SoC). Extracted so the matching logic can be built,
-// unit-tested, and benchmarked on x86 with a normal toolchain (gcc/clang),
-// without needing the FPGA board or a RISC-V cross-compiler.
+// Second life for this engine: it started as a bare-metal RISC-V program's
+// matching logic, got extracted to build/test/benchmark on a normal
+// toolchain, and lived for a while with the same constraint the board
+// forced on it -- fixed-size arrays, MAX_PRICE_LEVELS price slots per side,
+// no malloc. That held up fine for synthetic testing, but running real
+// NASDAQ order flow (LOBSTER) through it exposed the actual cost of that
+// constraint: once the top tracked price level's liquidity fully drains,
+// there's no way to discover the real next-best price, because anything
+// outside the narrow window was never recorded in the first place. By the
+// end of one real trading day the tracked best bid was off by close to a
+// dollar.
 //
-// Design constraints carried over from the bare-metal version on purpose:
-//   - No malloc/free. Fixed-size static arrays only (same memory model as
-//     the original, so benchmark results are representative of the
-//     bare-metal build, not an artifact of switching to dynamic allocation).
-//   - No floating point (the original board build disables hardware FPU
-//     paths / avoids soft-float call overhead).
+// The fix real matching engines use is the obvious one: don't cap how many
+// price levels you track. This is a C++ rewrite of the core around a
+// dynamic, price-indexed book (std::map/std::deque) with no depth limit --
+// a level exists exactly when at least one order rests there, same as a
+// real venue. The public API below stays C-callable (extern "C") so
+// tests/bench/tools can stay plain C and just link against it.
 // ============================================================================
 #ifndef ORDERBOOK_ENGINE_H
 #define ORDERBOOK_ENGINE_H
 
-#include <stdint.h>
-
-// Overridable via -DMAX_PRICE_LEVELS=N at compile time (see
-// `make lobster-test`), so a real order-flow replay can be validated
-// against ground-truth snapshots deeper than the board's real value of 3
-// — without touching this file for every depth tested.
-#ifndef MAX_PRICE_LEVELS
-#define MAX_PRICE_LEVELS   3
-#endif
-// Overridable via -DMAX_ORDERS_PER_LVL=N at compile time (see
-// `make depth-sweep`), to measure how the clean_ghosts/update_total_qty
-// optimizations scale as book depth grows past the board's real value of
-// 10 — without touching this file for every depth tested.
-#ifndef MAX_ORDERS_PER_LVL
-#define MAX_ORDERS_PER_LVL 10
-#endif
-#define INITIAL_CAPITAL    500000
+#define INITIAL_CAPITAL 500000
 // Pre-trade position limit for the player's own risk-checked market
-// orders (see ob_market_*_risk_checked_* below). Not present in main.c —
-// main.c's player_market_sell has no floor at all; a random 100k-op
-// stress test against the raw engine drove my_inventory to -168,805
-// with zero pushback, which is what motivated adding this.
-#define MAX_POSITION       500
-
-typedef struct {
-    int order_id;
-    int qty;
-    int ghost_qty;
-    int is_mine;
-    // Inherited its name from main.c's L3Order.visual_fx (there: 0=Normal,
-    // 1=Flash white on fill, 2=Ghost/pending cleanup — a UI render-state
-    // field). Only the Ghost value ever gets set or checked in this
-    // extracted engine (main.c's rendering code, which is the only place
-    // that ever used Flash, isn't part of this build) — so here it's
-    // purely matching-engine state, not a UI flag: 2 means "filled or
-    // cancelled, still occupying a queue slot until the next compaction
-    // pass removes it." Renamed to `state` to match what it actually does
-    // in this codebase, not what it was called in the one it came from.
-    int state; // 0=live, 2=ghost (filled/cancelled, pending ob_clean_ghosts_* compaction)
-} L3Order;
-
-typedef struct {
-    int price;
-    int total_qty;
-    int order_count;
-    L3Order queue[MAX_ORDERS_PER_LVL];
-} L3PriceLevel;
-
-typedef struct {
-    L3PriceLevel bids[MAX_PRICE_LEVELS];
-    L3PriceLevel asks[MAX_PRICE_LEVELS];
-} L3OrderBook;
+// orders (see ob_market_*_risk_checked_* below). A random 100k-op stress
+// test against the raw engine once drove my_inventory to -168,805 with
+// zero pushback, which is what motivated adding this.
+#define MAX_POSITION    500
+// Prices must be positive -- not a depth-window floor anymore (there's no
+// window), just basic input validation on insert.
+#define MIN_PRICE       1
 
 typedef struct {
     long   my_cash;
@@ -78,330 +42,150 @@ typedef struct {
     int    window_trade_qty;
 } EngineAccount;
 
-// ---- Original (baseline) implementation, functionally identical to main.c ----
+// Opaque -- the real definition (src/orderbook_engine.cpp) holds a
+// std::map<price, level> per side plus (for the opt functions only) an
+// order_id index. Nothing outside the engine reaches into it directly;
+// use the accessors near the bottom of this file instead.
+typedef struct L3OrderBook L3OrderBook;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+L3OrderBook *ob_create(void);
+void         ob_destroy(L3OrderBook *ob);
+
+// ---- Baseline / optimized, side by side, same as before ----
+// *_baseline: linear scan across every order in the book to find one by
+// id. *_opt: an order_id -> (side, price) index gets you straight to the
+// right price level first (O(log n) via the map), then a scan bounded by
+// that one level's depth, not the whole book. Matching itself (the
+// market_* functions) is identical between the two now -- there's no
+// "unoptimized" version of "walk price levels best-to-worst" worth
+// keeping once both use the same dynamic structure; see README for why
+// this replaces the old fixed-array baseline/opt split.
 void  ob_init_baseline(L3OrderBook *ob, EngineAccount *acc, int base_price);
-void  ob_clean_ghosts_baseline(L3PriceLevel *lvl);
-void  ob_update_total_qty_baseline(L3OrderBook *ob);
-void  ob_market_buy_baseline(L3OrderBook *ob, EngineAccount *acc, int qty, int is_player);
+void  ob_init_opt     (L3OrderBook *ob, EngineAccount *acc, int base_price);
+
+void  ob_market_buy_baseline (L3OrderBook *ob, EngineAccount *acc, int qty, int is_player);
+void  ob_market_buy_opt      (L3OrderBook *ob, EngineAccount *acc, int qty, int is_player);
 void  ob_market_sell_baseline(L3OrderBook *ob, EngineAccount *acc, int qty, int is_player);
+void  ob_market_sell_opt     (L3OrderBook *ob, EngineAccount *acc, int qty, int is_player);
 
-// ---- Optimized implementation (see orderbook_engine.c for the changes) ----
-void  ob_init_opt(L3OrderBook *ob, EngineAccount *acc, int base_price);
-void  ob_clean_ghosts_opt(L3PriceLevel *lvl);
-void  ob_update_total_qty_opt(L3OrderBook *ob);
-void  ob_market_buy_opt(L3OrderBook *ob, EngineAccount *acc, int qty, int is_player);
-void  ob_market_sell_opt(L3OrderBook *ob, EngineAccount *acc, int qty, int is_player);
-
-// Must be called by ANY code path that pushes a new order directly into
-// lvl->queue (e.g. the market-maker liquidity injection in process_tick).
-// This is the other half of "opt" incremental maintenance: fills/cancels
-// update total_qty incrementally inside ob_market_*_opt, and insertions
-// must update it incrementally here — otherwise total_qty silently drifts
-// out of sync with the true sum, since ob_update_total_qty_opt is no longer
-// called every tick to paper over it.
-//
-// Bounds-checked: lvl->queue has fixed capacity MAX_ORDERS_PER_LVL. Returns
-// 1 if the order was inserted, 0 if the level was already full (order
-// dropped, no state changed). The caller must not assume insertion always
-// succeeds. See README for why this check lives here rather than at each
-// call site.
-int   ob_add_order_opt(L3PriceLevel *lvl, L3Order order);
-
-// Baseline counterpart of ob_add_order_opt, with the same bounds-checked
-// contract (returns 1/0), so both implementations can be driven through an
-// identical function-pointer-compatible API in tests/benchmarks. Baseline
-// deliberately does NOT touch total_qty here — it stays correct only after
-// the next ob_update_total_qty_baseline() full rescan, matching main.c.
-int   ob_add_order_baseline(L3PriceLevel *lvl, L3Order order);
+// Inserts a raw order (any is_mine value) at `price`, creating that price
+// level if it doesn't exist yet. Used directly for third-party/noise
+// liquidity (is_mine=0) the same way it always has been; ob_place_limit_*
+// below builds is_mine=1 orders on top of it. Returns 1 on success, 0
+// only for invalid input (price <= 0 or qty <= 0) -- there's no capacity
+// to run out of anymore.
+int   ob_add_order_baseline(L3OrderBook *ob, int is_bid, int price, int order_id, int qty, int is_mine);
+int   ob_add_order_opt     (L3OrderBook *ob, int is_bid, int price, int order_id, int qty, int is_mine);
 
 // ----------------------------------------------------------------------
-// Resting player limit-order lifecycle (place + cancel-by-id).
-//
-// NOT present in main.c as a callable function. main.c's L3Order.is_mine
-// is *checked* in eight places (self-trade exclusion in the market-order
-// matchers, order rendering color, player_cancel_all_orders) but never
-// *set* to 1 anywhere in that 919-line file — grep for `is_mine = 1`
-// comes back empty. player_cancel_all_orders's cash/inventory refund
-// logic implies a "reserve on placement, refund on cancel" model that,
-// as shipped, has no placement function to pair with it: a real, if
-// incomplete, feature.
-//
-// The functions below complete that lifecycle inside the portable engine
-// (not board/main.c, which stays a verbatim historical artifact): reserve
-// cash/inventory at placement, insert an is_mine=1 resting order, and
-// cancel-by-id refunds exactly what was reserved. This is what actually
-// makes is_mine, the self-trade exclusion, and player_cancel_all_orders's
-// refund logic meaningful instead of dead branches.
+// Resting player limit-order lifecycle (place + cancel-by-id + modify).
+// Reserves cash (buy) or inventory (sell) at placement, refunds on
+// cancel -- same "is_mine" model as before, just addressed by real price
+// instead of a fixed level index. Returns the new order's id (>=0) on
+// success, -1 on rejection (bad price, qty <= 0, or can't cover it for
+// sells) with nothing reserved.
 // ----------------------------------------------------------------------
+int ob_place_limit_buy_baseline (L3OrderBook *ob, EngineAccount *acc, int price, int qty);
+int ob_place_limit_buy_opt      (L3OrderBook *ob, EngineAccount *acc, int price, int qty);
+int ob_place_limit_sell_baseline(L3OrderBook *ob, EngineAccount *acc, int price, int qty);
+int ob_place_limit_sell_opt     (L3OrderBook *ob, EngineAccount *acc, int price, int qty);
 
-// Places a resting is_mine buy at bids[level] / sell at asks[level] for
-// `qty`, reserving cash (buy) or inventory (sell) immediately, same as a
-// real limit order ties up capital the moment it rests in the book.
-// Returns the new order's id (>=0) on success, -1 if level is out of
-// range, qty <= 0, or the level's queue is already full (nothing
-// reserved on failure).
-int ob_place_limit_buy_baseline (L3OrderBook *ob, EngineAccount *acc, int level, int qty);
-int ob_place_limit_buy_opt      (L3OrderBook *ob, EngineAccount *acc, int level, int qty);
-int ob_place_limit_sell_baseline(L3OrderBook *ob, EngineAccount *acc, int level, int qty);
-int ob_place_limit_sell_opt     (L3OrderBook *ob, EngineAccount *acc, int level, int qty);
-
-// Cancels a single resting is_mine order by id, wherever it sits in the
-// book (bids or asks, any level), refunding the cash/inventory reserved
-// at placement. Returns 1 if found and cancelled, 0 if not found (already
-// filled, already cancelled, or an id that never existed / isn't ours).
-//
-// O(orders) linear scan across the whole book. Deliberately not indexed:
-// book size is capped at MAX_PRICE_LEVELS * MAX_ORDERS_PER_LVL * 2 orders
-// (60 at the board's real depth), so a scan is a handful of cache-line
-// reads, not a bottleneck. A production engine handling unbounded depth
-// would maintain an order_id -> (side, level, index) map for O(1) cancel;
-// not worth the complexity here without evidence (profiling) that this
-// scan is ever hot, at this depth.
+// Cancels a single resting is_mine order by id, wherever it sits.
+// Refunds whatever was reserved at placement. Returns 1 if found and
+// cancelled, 0 if not (already filled/cancelled, or not ours).
 int ob_cancel_order_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id);
 int ob_cancel_order_opt     (L3OrderBook *ob, EngineAccount *acc, int order_id);
 
-// ----------------------------------------------------------------------
-// Cancel-replace (order modification), split into the two cases real
-// venues actually treat differently — this isn't one function because
-// the underlying behavior genuinely isn't one thing:
-//
-//   - A pure quantity change never has to move the order in the queue —
-//     nothing about *where* it sits changed, so ob_modify_qty_* mutates
-//     it in place and the order KEEPS its id and its queue position
-//     (i.e. keeps whatever time priority it already had).
-//   - A price/level change is different: at a real venue, moving an
-//     order to a different price essentially always forfeits queue
-//     priority (it's now competing at a level it wasn't resting at
-//     before). ob_modify_price_* models that honestly instead of
-//     pretending otherwise — it's cancel-old + place-new under the hood,
-//     the new order gets a NEW id, and it goes to the back of the new
-//     level's queue like any other placement. Calling it at the *same*
-//     level the order is already resting at is a legal way to change qty
-//     while deliberately giving up priority (goes to the back of that
-//     same queue) — the difference from ob_modify_qty_* is exactly that
-//     priority trade-off, not a quirk.
-//
-// Both reuse the already-tested ob_place_limit_*/ob_cancel_order_*
-// functions rather than reimplementing reservation logic a third time.
-// ----------------------------------------------------------------------
-
-// Changes a resting is_mine order's quantity without moving it — same id,
-// same (level, slot), same queue position. Increasing qty reserves the
-// additional cash (buy) or inventory (sell); decreasing refunds the
-// difference. Returns 1 on success, 0 if order_id isn't a live order of
-// ours, new_qty <= 0, or an increase can't be covered — nothing is
-// mutated on rejection, same discipline as every placement function here.
+// Quantity change in place -- same id, same queue position (keeps time
+// priority). Increasing reserves the difference; decreasing refunds it.
+// Returns 1 on success, 0 if order_id isn't a live order of ours,
+// new_qty <= 0, or an increase can't be covered.
 int ob_modify_qty_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id, int new_qty);
 int ob_modify_qty_opt     (L3OrderBook *ob, EngineAccount *acc, int order_id, int new_qty);
 
-// Moves a resting is_mine order to a different level/qty — cancel-old +
-// place-new, deliberately in that order reversed: place-new is tried
-// FIRST, and the old order is only cancelled if that succeeds. If the new
-// placement is rejected (bad level, qty <= 0, insufficient cash/inventory,
-// full queue), the original order is left completely untouched rather
-// than risking ending up with neither the old order nor a new one.
-//
-// Trade-off stated plainly: for a moment both the old and the new
-// order's reservations are held at once (the old one isn't refunded
-// until after the new one is confirmed placed), so this can reject a
-// move that a venue netting collateral in real time would have allowed.
-// Netting it instead would mean modifying ob_place_limit_*_opt itself
-// (breaking the "wrapper, not a modification" rule the risk-limit and
-// indexed-cancel features above already committed to) or reimplementing
-// reservation logic a third time — not worth it without evidence this
-// ever actually blocks a legitimate move at this book's scale.
-//
-// Returns the NEW order's id (>=0) on success, or -1 on rejection (old
-// order still live, nothing changed).
-int ob_modify_price_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id, int new_level, int new_qty);
-int ob_modify_price_opt     (L3OrderBook *ob, EngineAccount *acc, int order_id, int new_level, int new_qty);
+// Price change -- cancel-old + place-new (place first, only cancel the
+// old one once the new placement is confirmed, so a rejected move leaves
+// the original completely untouched). New id, back of the new price's
+// queue, same as placing any other new order. Returns the new id (>=0)
+// or -1 on rejection.
+int ob_modify_price_baseline(L3OrderBook *ob, EngineAccount *acc, int order_id, int new_price, int new_qty);
+int ob_modify_price_opt     (L3OrderBook *ob, EngineAccount *acc, int order_id, int new_price, int new_qty);
 
 // ----------------------------------------------------------------------
-// Third-party (is_mine=0) order cancel / qty-reduce — for replaying real
-// order flow (e.g. LOBSTER), where cancelled/reduced orders overwhelmingly
-// belong to anonymous participants, not "the player". ob_cancel_order_*/
-// ob_modify_qty_* above only ever touch is_mine=1 orders (they refund a
-// cash/inventory reservation that only is_mine orders have); these two
-// mirror that logic minus the is_mine filter and the refund, so an order
-// injected via ob_add_order_*(is_mine=0) can be cancelled or reduced by id
-// too. No existing function's behavior changes.
+// Third-party (is_mine=0) order cancel / qty-reduce -- for replaying real
+// order flow (LOBSTER etc.), where cancelled/reduced orders overwhelm-
+// ingly belong to anonymous participants, not "the player". Same as
+// ob_cancel_order_*/ob_modify_qty_* above minus the is_mine filter and
+// the cash/inventory refund (third-party orders never reserved any).
 //
-// ob_cancel_order_any_*: same 1/0 contract as ob_cancel_order_*, but finds
-// and removes a live order regardless of is_mine.
+// ob_reduce_order_qty_any_*: delta_qty is an amount to REMOVE (LOBSTER
+// Type 2 semantics), not a new absolute quantity. Rejects (nothing
+// mutated) if delta_qty <= 0 or > the order's current qty; equal to the
+// current qty fully removes the order.
+// ----------------------------------------------------------------------
 int ob_cancel_order_any_baseline(L3OrderBook *ob, int order_id);
 int ob_cancel_order_any_opt     (L3OrderBook *ob, int order_id);
-
-// ob_reduce_order_qty_any_*: delta_qty is an amount to REMOVE from the
-// order's current qty (LOBSTER Type 2 semantics), not a new absolute
-// quantity like ob_modify_qty_*'s new_qty. Rejects (nothing mutated) if
-// delta_qty <= 0 or delta_qty > the order's current qty; delta_qty equal
-// to the current qty fully removes the order. Returns 1 on success, 0 on
-// rejection or if order_id isn't a live order.
 int ob_reduce_order_qty_any_baseline(L3OrderBook *ob, int order_id, int delta_qty);
 int ob_reduce_order_qty_any_opt     (L3OrderBook *ob, int order_id, int delta_qty);
 
 // ----------------------------------------------------------------------
-// Price drift — not present in main.c or anywhere else in this engine
-// until now: every price level is set once in ob_init_* and NEVER moves
-// again on its own. That's fine for testing the matching/lifecycle logic
-// in isolation, but it means a market maker built on this engine has no
-// fair-value risk to actually manage — inventory can never lose money to
-// "the market moved against you," because the market structurally can't
-// move (see engine README's "Trace visualizer" section, where this was
-// first noticed, and the Market-Maker-Strategy repo's README, which
-// states outright that its inventory skew has no adverse-selection risk
-// to defend against as a result).
-//
-// ob_drift_price_* shifts every level's price by `delta` (bids and asks
-// together, same shift, so the spread and level spacing ob_init_*
-// established never change — only where the whole ladder sits). This is
-// a primitive, not a policy: it doesn't decide *when* or *how much* to
-// drift — something external (a test, a trace scenario, eventually the
-// strategy's own market-simulation harness) calls it, the same way
-// nothing inside this engine ever decides when a market order arrives.
-//
-// Honest limitation, not glossed over: this engine has exactly
-// MAX_PRICE_LEVELS fixed slots per side, unlike a real order book where
-// price levels are created and destroyed as orders arrive at whatever
-// price they name. Drifting is therefore a relabeling of what those
-// fixed slots' price tags are, not a simulation of new levels appearing —
-// which means an order resting in a level when it drifts gets, in effect,
-// repriced along with the level: ob_market_buy_opt/sell_opt charge
-// (long)fill * lvl->price using whatever the level's CURRENT price is at
-// fill time, not whatever price was in effect when the order was placed.
-// A faithful multi-level book wouldn't do this; this one does, as a
-// direct consequence of the fixed-slot model everything else here is
-// already built on, not a bug introduced by this feature specifically.
-//
-// Returns 1 if applied, 0 if it would push any bid level below MIN_PRICE
-// (1) — rejected outright (nothing mutated), not silently clamped, so a
-// caller running a repeated random walk can just skip that step instead
-// of the walk silently getting stuck at a floor.
-#define MIN_PRICE 1
-int ob_drift_price_baseline(L3OrderBook *ob, int delta);
-int ob_drift_price_opt     (L3OrderBook *ob, int delta);
-
+// Pre-trade risk limit for the player's own market orders. Wraps
+// ob_market_buy_*/ob_market_sell_* (unchanged) rather than modifying
+// them. Clips the requested qty down to whatever room remains under
+// MAX_POSITION before it touches the book. Returns the qty actually
+// submitted (may be less than requested, or 0 -- not an error, just "no
+// trade, on purpose").
 // ----------------------------------------------------------------------
-// Pre-trade risk limit for the player's own market orders.
-//
-// main.c's player_market_buy/player_market_sell have no position check
-// at all — a real (unconstrained) test run against this engine's raw
-// ob_market_sell_*(..., is_player=1) drove my_inventory to -168,805 over
-// 100,000 random operations with nothing stopping it. Real venues call
-// this a pre-trade position/fat-finger limit: the last check before an
-// order is allowed to add more risk than the desk is willing to carry.
-//
-// These wrap ob_market_buy_*/ob_market_sell_* (unchanged, still exactly
-// main.c's behavior — is_player=1 fills, no limit) rather than modifying
-// them: main.c's ported functions need to keep being a faithful port,
-// since the correctness harness's whole methodology depends on baseline
-// staying baseline. The risk check is a layer on top, not a change to
-// what "baseline" means.
-//
-// Behavior: clips the requested qty down to whatever room remains under
-// MAX_POSITION before it touches the book (reduce, don't bounce) — mirrors
-// how real pre-trade size limiters behave. Returns the qty actually
-// submitted to matching, which may be less than requested, or 0 if
-// already at the limit (0 is not an error; it means "no trade happened,
-// on purpose"). Only meaningful for the player's own position — the
-// market-maker/noise side of the simulated book (is_player=0 fills) is
-// not the desk's own risk and is intentionally not gated here.
 int ob_market_buy_risk_checked_baseline (L3OrderBook *ob, EngineAccount *acc, int qty);
 int ob_market_buy_risk_checked_opt      (L3OrderBook *ob, EngineAccount *acc, int qty);
 int ob_market_sell_risk_checked_baseline(L3OrderBook *ob, EngineAccount *acc, int qty);
 int ob_market_sell_risk_checked_opt     (L3OrderBook *ob, EngineAccount *acc, int qty);
 
 // ----------------------------------------------------------------------
-// O(1) cancel-by-id index (opt only, x86 side — not part of the memcmp'd
-// L3OrderBook/L3PriceLevel/L3Order layout the baseline<->opt correctness
-// harness in tests/test_correctness.c relies on).
-//
-// ob_cancel_order_opt (above) is a deliberate O(orders-in-book) linear
-// scan across the whole book, justified there by the book being capped at
-// ~60 orders at the board's real depth. That justification stops holding
-// once MAX_ORDERS_PER_LVL is scaled up (see `make depth-sweep`, which
-// drives it to 400) — at that depth a cancel walks up to 2400 order
-// slots. This section adds an O(1)-lookup path for that case, without
-// touching ob_cancel_order_opt or the shared L3OrderBook/L3PriceLevel/
-// L3Order types at all, because of two hard constraints already baked
-// into this codebase:
-//
-//   1. tests/test_correctness.c proves baseline == opt with a raw
-//      memcmp(a, b, sizeof(L3OrderBook)). Any extra per-order bookkeeping
-//      (a self-index, a generation counter, ...) added to L3Order or
-//      L3PriceLevel would make that memcmp fail immediately, since
-//      baseline has no equivalent field to keep in sync. So the index
-//      lives in its own struct, populated/maintained by new wrapper
-//      functions, not inside the order/level structs themselves.
-//
-//   2. bench/benchmark.c drives ob_clean_ghosts_opt through a generic
-//      `void (*)(L3PriceLevel *)` function pointer, identically to
-//      baseline's clean_ghosts, so the two stay directly comparable.
-//      Giving ob_clean_ghosts_opt an extra parameter to keep an index in
-//      sync during compaction would break that shared calling contract.
-//      So ob_clean_ghosts_opt is left untouched, which means a compaction
-//      can still silently move an indexed order to a new slot within its
-//      level without the index knowing.
-//
-// The design that fits both constraints: the index caches (level, slot)
-// per order id. A lookup checks the cached slot first — O(1), and correct
-// whenever no compaction has touched that level since the order was
-// placed or last found, which is the common case. If the cached slot
-// doesn't match (a compaction moved it), the fallback rescans only that
-// ONE level (bounded by MAX_ORDERS_PER_LVL), never the rest of the book.
-// So this is O(1) amortized with an O(single-level-depth) worst case,
-// strictly better than baseline's unconditional O(whole-book-depth) in
-// every case, and exactly O(1) in the common one.
-//
-// Open addressing, linear probing, fixed-size static array — no malloc,
-// same memory model as everything else here. Capacity is a flat 8192:
-// the maximum possible concurrently-live is_mine orders across every
-// depth `make depth-sweep` tests (DEPTHS up to 400 in the Makefile) is
-// 2 sides * MAX_PRICE_LEVELS(3) * 400 = 2400, so 8192 keeps the load
-// factor under ~30% even at the largest swept depth.
+// Read-only accessors -- L3OrderBook is opaque now, so this is how
+// outside code (tests, benchmarks, tools/book_trace.c, the LOBSTER
+// tools) reads book state instead of reaching into struct fields
+// directly. level_index counts from the best price (0 = best). All
+// return -1 (or 0 for ob_level_order_at) if is_bid/level_index/slot is
+// out of range, rather than crashing on a bad index.
 // ----------------------------------------------------------------------
-#define ORDER_INDEX_CAPACITY 8192
+int  ob_num_levels(const L3OrderBook *ob, int is_bid);
+int  ob_level_price(const L3OrderBook *ob, int is_bid, int level_index);
+long ob_level_qty(const L3OrderBook *ob, int is_bid, int level_index);
+int  ob_level_order_count(const L3OrderBook *ob, int is_bid, int level_index);
+int  ob_level_order_at(const L3OrderBook *ob, int is_bid, int level_index, int slot,
+                        int *out_order_id, int *out_qty, int *out_is_mine);
 
-typedef struct {
-    int32_t        order_id; // -1 = empty slot, -2 = tombstone (cancelled/removed)
-    L3PriceLevel  *lvl;
-    uint16_t       slot;
-    uint8_t        is_bid;
-} OrderIndexEntry;
+// Deep, semantic equality (same price levels in the same order, same qty
+// at each, same orders resting at each one) -- for baseline/opt
+// differential testing. Implemented natively over the internal
+// std::map/std::deque (a single linear pass, O(total orders)) rather
+// than composed from the per-index accessors above, which would be
+// O(levels) *per call* and O(levels^2) if you looped them -- exactly
+// the mistake this function exists to let callers avoid.
+int ob_books_equal(const L3OrderBook *a, const L3OrderBook *b);
 
-typedef struct {
-    OrderIndexEntry buckets[ORDER_INDEX_CAPACITY];
-} OrderIndex;
+// Dumps up to max_levels levels of one side (best first) into two
+// parallel arrays in a single pass -- O(levels), not O(levels) per
+// index the way calling ob_level_price/ob_level_qty in a loop would be.
+// Returns how many levels were actually written.
+int ob_dump_levels(const L3OrderBook *ob, int is_bid, int max_levels, int *out_prices, long *out_qtys);
 
-// Must be called once before first use (equivalent of ob_init_* for the
-// index itself). Marks every bucket empty.
-void ob_index_init(OrderIndex *idx);
+// Total resting qty at an exact price (0 if nothing rests there, not an
+// error -- a price with no orders just isn't a level). O(log levels).
+// This is what makes comparing against an external ground truth (see the
+// LOBSTER tools) a direct lookup instead of the tick-offset
+// reconstruction the old fixed-array engine needed: both sides now only
+// ever represent prices that actually have resting orders, so there's no
+// representational gap to bridge anymore.
+long ob_qty_at_price(const L3OrderBook *ob, int is_bid, int price);
 
-// Same contract as ob_place_limit_buy_opt/ob_place_limit_sell_opt (see
-// above), but also registers the new order in `idx` so it can later be
-// found in O(1) by ob_cancel_order_opt_indexed. Internally calls the
-// existing, already-tested ob_place_limit_buy_opt/sell_opt — this does
-// not duplicate or reimplement the placement logic, only adds indexing
-// on top of it.
-int ob_place_limit_buy_opt_indexed (L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int level, int qty);
-int ob_place_limit_sell_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int level, int qty);
-
-// O(1) amortized counterpart to ob_cancel_order_opt: hashes order_id to
-// its cached (level, slot) instead of scanning the whole book. Falls back
-// to scanning only the one level the index points at if the cached slot
-// went stale (see file comment above for exactly when/why that happens).
-// Same return contract as ob_cancel_order_opt: 1 if found and cancelled,
-// 0 if not (already gone, or never existed).
-int ob_cancel_order_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int order_id);
-
-// O(1) counterparts to ob_modify_qty_opt/ob_modify_price_opt, using the
-// index instead of a whole-book scan to find the order. Same semantics
-// and same return contracts as their non-indexed counterparts above.
-// ob_modify_qty_opt_indexed doesn't need to touch `idx` at all beyond the
-// lookup (the order's (level, slot) never changes); ob_modify_price_opt_indexed
-// re-registers the new order and removes the old one, same as calling
-// ob_place_limit_*_opt_indexed + ob_cancel_order_opt_indexed separately.
-int ob_modify_qty_opt_indexed  (L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int order_id, int new_qty);
-int ob_modify_price_opt_indexed(L3OrderBook *ob, EngineAccount *acc, OrderIndex *idx, int order_id, int new_level, int new_qty);
+#ifdef __cplusplus
+}
+#endif
 
 #endif // ORDERBOOK_ENGINE_H

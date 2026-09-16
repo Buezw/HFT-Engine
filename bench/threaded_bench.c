@@ -91,20 +91,13 @@ static void simulate_receive_jitter(uint32_t *rng) {
 
 #define N_MESSAGES 20000
 
-static void clean_all(L3OrderBook *ob) {
-    for (int lvl = 0; lvl < MAX_PRICE_LEVELS; lvl++) {
-        ob_clean_ghosts_opt(&ob->bids[lvl]);
-        ob_clean_ghosts_opt(&ob->asks[lvl]);
-    }
-}
-
 // ---------------------------------------------------------------------
 // Baseline: jitter and matching serialized on one thread.
 // ---------------------------------------------------------------------
 static void run_baseline(long long *gaps_out) {
-    L3OrderBook ob;
+    L3OrderBook *ob = ob_create();
     EngineAccount acc;
-    ob_init_opt(&ob, &acc, 100);
+    ob_init_opt(ob, &acc, 100);
     uint32_t rng = 0xB16B00B5u;
 
     long long prev = now_ns();
@@ -114,13 +107,13 @@ static void run_baseline(long long *gaps_out) {
         int is_buy = xorshift32(&rng) & 1;
 
         long long t0 = now_ns();
-        if (is_buy) ob_market_buy_opt(&ob, &acc, qty, 0);
-        else ob_market_sell_opt(&ob, &acc, qty, 0);
-        clean_all(&ob);
+        if (is_buy) ob_market_buy_opt(ob, &acc, qty, 0);
+        else ob_market_sell_opt(ob, &acc, qty, 0);
 
         gaps_out[i] = t0 - prev;
         prev = t0;
     }
+    ob_destroy(ob);
 }
 
 // ---------------------------------------------------------------------
@@ -151,9 +144,9 @@ static void *producer_thread(void *arg) {
 // number into producer_thread's pthread_create signature without changing
 // it — fine here since only one producer ever runs at a time).
 static int run_threaded(long long *gaps_out, int matcher_core, int producer_core) {
-    L3OrderBook ob;
+    L3OrderBook *ob = ob_create();
     EngineAccount acc;
-    ob_init_opt(&ob, &acc, 100);
+    ob_init_opt(ob, &acc, 100);
     spsc_init(&g_ring);
 
     if (matcher_core >= 0) pin_to_core(matcher_core);
@@ -170,15 +163,15 @@ static int run_threaded(long long *gaps_out, int matcher_core, int producer_core
         if (m.type == MSG_STOP) break;
 
         long long t0 = now_ns();
-        if (m.type == MSG_MARKET_BUY) ob_market_buy_opt(&ob, &acc, m.qty, 0);
-        else ob_market_sell_opt(&ob, &acc, m.qty, 0);
-        clean_all(&ob);
+        if (m.type == MSG_MARKET_BUY) ob_market_buy_opt(ob, &acc, m.qty, 0);
+        else ob_market_sell_opt(ob, &acc, m.qty, 0);
 
         gaps_out[count++] = t0 - prev;
         prev = t0;
     }
 
     pthread_join(producer, NULL);
+    ob_destroy(ob);
     return count;
 }
 

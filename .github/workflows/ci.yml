@@ -11,16 +11,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build + run correctness tests (gcc)
+      - name: Build + run correctness tests (gcc/g++)
         run: make test
 
-      - name: Build + run benchmark (gcc)
+      - name: Build + run benchmark (gcc/g++)
         run: make bench
 
-      - name: Build + run LOBSTER replay against the committed synthetic fixture (gcc)
+      - name: Build + run LOBSTER replay against the committed synthetic fixture (gcc/g++)
         run: make lobster-test
 
-      - name: Build + run correctness tests under ASan/UBSan (clang)
+      - name: Build + run correctness tests under ASan/UBSan (clang/clang++)
         run: make asan
 
       - name: Build + run spsc_ring stress test under ThreadSanitizer (clang)
