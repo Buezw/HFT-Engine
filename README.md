@@ -19,10 +19,11 @@ engine core**, so the performance-critical logic can be validated and
 measured on a normal machine instead of only living inside a board-only
 build.
 
-The engine itself (`src/orderbook_engine.cpp`) is C++ now, not C — see
-"C++ rewrite: a dynamic order book" below for why. Everything else
-(`tests/`, `bench/`, `tools/`) stays plain C and links against it through
-a C API.
+The whole desktop project is C++17: the engine (`src/orderbook_engine.cpp`,
+see "C++ rewrite: a dynamic order book" below for why) and everything
+that links against it (`tests/`, `bench/`, `tools/`). The only C file
+left is `board/main.c`, the original bare-metal program, which the
+Makefile doesn't build.
 
 ## C++ rewrite: a dynamic order book
 
@@ -47,9 +48,10 @@ leaves) and `std::deque<Order>` per level, with no `MAX_PRICE_LEVELS` or
 `MAX_ORDERS_PER_LVL` anywhere. `L3OrderBook` is opaque now (`ob_create`/
 `ob_destroy`, read state through accessors like `ob_level_price`/
 `ob_num_levels` instead of struct fields) so the public API in
-`include/orderbook_engine.h` stays plain C — `tests/`, `bench/`, and
-`tools/` didn't need to become C++ themselves, just update their call
-sites.
+`include/orderbook_engine.h` stayed a set of free `ob_*` functions —
+`tests/`, `bench/`, and `tools/` only had to update their call sites.
+(They were plain C at the time, linking through `extern "C"`; they've
+since been moved to C++ too, see "Everything else moved to C++" below.)
 
 **What this removed, because a dynamic book doesn't need it:**
 - **Price drift** (`ob_drift_price_*`) — existed to relabel fixed slots
@@ -97,24 +99,54 @@ from a genuinely empty book (see "LOBSTER real-market-data validation"
 below for that data-completeness caveat, which is unrelated to and
 predates this rewrite), not a tracking failure.
 
+## Everything else moved to C++
+
+After the engine rewrite, `tests/`, `bench/`, and `tools/` were still C,
+linking against the engine through `extern "C"`. They're C++17 now too,
+so the whole desktop build is one language and one compiler driver.
+The `ob_*` API is unchanged (same names and signatures, just no
+`extern "C"` block), so no test logic had to change. What moved:
+
+- **`spsc_ring.h`** — `_Atomic size_t` + `atomic_load_explicit` became a
+  header-only `SpscRing` class over `std::atomic<std::size_t>`, with the
+  same acquire/release pairing and the same memory layout. `src/spsc_ring.c`
+  is gone.
+- **Threads and timing** — `pthread_create`/`pthread_join` became
+  `std::thread`, and `clock_gettime(CLOCK_MONOTONIC)` became
+  `std::chrono::steady_clock`, which is the same clock on Linux. Core
+  pinning in `threaded_bench.cpp` still calls `pthread_setaffinity_np`,
+  because `std::thread` has no portable affinity API.
+- **Memory** — `malloc`'d sample buffers became `std::vector`, and `qsort`
+  became `std::sort`. The LOBSTER tools' hand-rolled fixed-capacity id set
+  (`DroppedSet`, 1<<20 slots, `abort()` when full) became a
+  `std::unordered_set`, which has no capacity to outgrow.
+- **I/O** — the LOBSTER readers use `std::ifstream` + `std::getline`
+  instead of `FILE*` + `fgets`. Output still goes through `printf`, so
+  every report is formatted exactly as before.
+
+Verified the same way the engine rewrite was: `test_correctness`,
+`book_trace 300`, and `lobster_replay` produce byte-identical output before
+and after the change, on the committed fixture and on full GOOG, AAPL, and
+MSFT days. `make asan`, `make tsan`, and `make cppcheck` are clean.
+
 ## Files
 
 ```
 board/main.c                 original bare-metal program (RISC-V/DE1-SoC only)
-include/orderbook_engine.h   public C API + opaque L3OrderBook, EngineAccount
+include/orderbook_engine.h   public ob_* API + opaque L3OrderBook, EngineAccount
 src/orderbook_engine.cpp     C++ implementation: dynamic std::map/std::deque book, baseline + opt
-tests/test_correctness.c     200k-tick replay + lifecycle/stress/risk-limit tests (plain C, links against the C++ engine)
-bench/benchmark.c            baseline-vs-optimized timing: mean, percentiles, runtime depth sweep
-tools/book_trace.c           runs a scenario against the opt engine, dumps per-tick JSON
+tests/test_correctness.cpp   200k-tick replay + lifecycle/stress/risk-limit tests
+bench/benchmark.cpp          baseline-vs-optimized timing: mean, percentiles, runtime depth sweep
+tools/book_trace.cpp         runs a scenario against the opt engine, dumps per-tick JSON
 tools/render_trace.py        wraps the JSON trace into a self-contained HTML replay
 tools/visualizer_template.html  the replay page itself (ladder + inventory/PnL/depth charts)
 tools/capability_map.html    static reference: every public function, plain-language, no code reading required
-include/spsc_ring.h / src/spsc_ring.c   lock-free single-producer/single-consumer queue
-tests/test_spsc_ring.c       FIFO/capacity boundary tests + a real 2M-item multithreaded stress test
-bench/threaded_bench.c       measures whether splitting receive/match onto two threads helps or hurts
+include/spsc_ring.h          header-only lock-free single-producer/single-consumer queue (std::atomic)
+tests/test_spsc_ring.cpp     FIFO/capacity boundary tests + a real 2M-item multithreaded stress test
+bench/threaded_bench.cpp     measures whether splitting receive/match onto two threads helps or hurts
 tools/lobster_format.h       shared LOBSTER message-format decoding (used by the two tools below)
-tools/lobster_replay.c       replays real order flow, cross-checks book state against LOBSTER ground truth
-bench/lobster_bench.c        baseline-vs-opt latency under real (not synthetic) order flow
+tools/lobster_replay.cpp     replays real order flow, cross-checks book state against LOBSTER ground truth
+bench/lobster_bench.cpp      baseline-vs-opt latency under real (not synthetic) order flow
 tests/fixtures/lobster_sample/  hand-built LOBSTER-format fixture, regression-tests the replay tool itself
 Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep / visualize / threaded-bench / lobster-test / lobster-bench / clean targets
 .github/workflows/ci.yml     runs test / bench / lobster-test / asan / tsan / cppcheck on every push/PR
@@ -142,7 +174,7 @@ Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep
     `ob_reduce_order_qty_any_*`, for orders that aren't the player's own —
     see "LOBSTER real-market-data validation" below) — all new in the
     extracted engine, not ports of anything in `main.c`.
-- `tests/test_correctness.c` — nine things, in order: (1) replays 200,000
+- `tests/test_correctness.cpp` — nine things, in order: (1) replays 200,000
   ticks of synthetic market-maker + player activity against both engines
   and asserts identical account state and book state after every tick —
   this has to pass before any benchmark number means anything; (2)
@@ -164,23 +196,24 @@ Makefile                     test / bench / asan / tsan / cppcheck / depth-sweep
   `ob_cancel_order_any_*`/`ob_reduce_order_qty_any_*` correctly find and
   mutate it (partial reduce, exact-zero-removal, reject-over-large,
   bogus-id).
-- `bench/benchmark.c` — measures baseline vs optimized under identical
-  workload using `clock_gettime(CLOCK_MONOTONIC)`, reporting the mean,
+- `bench/benchmark.cpp` — measures baseline vs optimized under identical
+  workload using `std::chrono::steady_clock` (`CLOCK_MONOTONIC` on
+  Linux), reporting the mean,
   the p50/p90/p99/p99.9 latency distribution per tick, and (via
   `--depth-sweep`/`make depth-sweep`) how the gap between baseline
   (linear scan) and opt (indexed) scales as book depth grows — a runtime
   loop now, not a recompile at different `-D` values, since there's no
   compile-time capacity left to vary.
-- `include/spsc_ring.h` / `src/spsc_ring.c` — a lock-free single-producer/
-  single-consumer ring buffer, used by `bench/threaded_bench.c` to hand
+- `include/spsc_ring.h` — a header-only lock-free single-producer/
+  single-consumer ring buffer (`SpscRing`, `std::atomic` head/tail), used by `bench/threaded_bench.cpp` to hand
   messages from a "receiver" thread to the (still single-threaded)
-  matching thread. `tests/test_spsc_ring.c` covers FIFO order and the
+  matching thread. `tests/test_spsc_ring.cpp` covers FIFO order and the
   exact capacity boundary, plus a real 2,000,000-item two-thread stress
   test, clean under both ASan and — since a lock-free queue's actual risk
   is a data race, not a memory-safety bug — ThreadSanitizer specifically
   (`make tsan`). See "Threaded ingestion" below for what this is for and
   what got measured.
-- `tools/lobster_format.h` / `tools/lobster_replay.c` / `bench/lobster_bench.c`
+- `tools/lobster_format.h` / `tools/lobster_replay.cpp` / `bench/lobster_bench.cpp`
   — replays a real LOBSTER order-flow stream through both engines,
   cross-checks the result against LOBSTER's own reconstructed order book
   (external ground truth, not a baseline-vs-opt self-check), and
@@ -224,7 +257,7 @@ insertion line, not a theoretical concern.
 relying on every caller to remember it externally — `ob_add_order_opt` and
 the new `ob_add_order_baseline` (added for a symmetric, safe API on both
 sides) now return `1`/`0` for accept/reject and refuse to touch `queue[]`
-or `total_qty` at all on rejection. `tests/test_correctness.c` has a
+or `total_qty` at all on rejection. `tests/test_correctness.cpp` has a
 dedicated regression test that fills a level to exact capacity, attempts
 one more insert, and asserts it's rejected with zero state mutation —
 verified clean via `make asan` (clang; gcc's ASan/UBSan runtime was broken
@@ -359,7 +392,7 @@ interrupt) do more work than necessary:
      rescan is removed from the per-tick hot path entirely.
 
 Both were verified to produce byte-identical account and book state to the
-original across 200,000 simulated ticks (`test_correctness.c`) before any
+original across 200,000 simulated ticks (`test_correctness.cpp`) before any
 performance number was trusted.
 
 ## O(1) cancel-by-id index
@@ -383,7 +416,7 @@ stops holding. This section is the O(1) alternative for that case.
 
 Two hard constraints, already baked into this codebase, shaped the design:
 
-1. `test_correctness.c` proves baseline == opt with a raw
+1. `test_correctness.cpp` proves baseline == opt with a raw
    `memcmp(a, b, sizeof(L3OrderBook))`. Any extra per-order bookkeeping
    added to `L3Order` or `L3PriceLevel` (a self-index, a generation
    counter) would make that `memcmp` fail immediately, since baseline has
@@ -391,7 +424,7 @@ Two hard constraints, already baked into this codebase, shaped the design:
    in its own struct, populated by new wrapper functions
    (`ob_place_limit_*_opt_indexed`, `ob_cancel_order_opt_indexed`), never
    inside the order/level structs themselves.
-2. `bench/benchmark.c` drives `ob_clean_ghosts_opt` through a generic
+2. `bench/benchmark.cpp` drives `ob_clean_ghosts_opt` through a generic
    `void (*)(L3PriceLevel *)` function pointer, identically to baseline's
    `clean_ghosts`, so the two stay directly comparable. Giving
    `ob_clean_ghosts_opt` an extra parameter to keep an index in sync
@@ -421,7 +454,7 @@ and indexed cancels, diffing full account+book state against the plain
 linear-scan cancel after every single operation. All three pass under
 `make asan`.
 
-Measured, not just argued — `bench/benchmark.c` cancels an order pinned at
+Measured, not just argued — `bench/benchmark.cpp` cancels an order pinned at
 the worst-case position (last slot of the last ask level, the last place
 `ob_cancel_order_opt`'s scan would ever reach) for both variants:
 
@@ -583,7 +616,7 @@ desktop-testable engine had nothing: `printf("PASS")` and raw nanosecond
 numbers, no way to actually see book state, fills, or account state change
 over time. `make visualize` fixes that:
 
-- `tools/book_trace.c` runs a fixed, reproducible 300-tick scenario (market
+- `tools/book_trace.cpp` runs a fixed, reproducible 300-tick scenario (market
   noise liquidity + noise market orders, player limit placements/cancels,
   player risk-checked market orders — the same public API used everywhere
   else in this project, not a second implementation of anything) against
@@ -723,7 +756,7 @@ until it's updated.
 ## LOBSTER real-market-data validation
 
 Every correctness result above comes from one engine checked against
-itself: `tests/test_correctness.c` replays synthetic order flow through
+itself: `tests/test_correctness.cpp` replays synthetic order flow through
 both `_baseline` and `_opt` and `memcmp`s the result. That proves the two
 implementations agree; it can't catch a bug both of them share (which is
 exactly what happened once already — see "A fill-direction bug" below).
@@ -735,11 +768,11 @@ real order flow this engine never saw synthesized.
 message file (every submission/cancel/delete/execution, timestamped to
 the nanosecond) paired line-for-line with an orderbook file (the
 independently reconstructed book snapshot after each message). `make
-lobster-test` (`tools/lobster_replay.c`) replays the message stream
+lobster-test` (`tools/lobster_replay.cpp`) replays the message stream
 through both `_baseline` and `_opt`, translating each LOBSTER event into
 calls on this engine's public API, and cross-checks the result against
 the paired orderbook file after every synced event. `make lobster-bench`
-(`bench/lobster_bench.c`, sharing the same message-format decoding via
+(`bench/lobster_bench.cpp`, sharing the same message-format decoding via
 `tools/lobster_format.h`) times the same translated calls instead of
 checking them, to see whether real inter-arrival timing and order-size
 distributions change the p99/p99.9 tail latency the synthetic
@@ -796,11 +829,50 @@ submitted (`refs to pre-window orders` in the summary), and any book
 comparison touching that residual liquidity will legitimately disagree
 with ground truth for as long as it's outstanding. That's a property of
 where the data window starts, not a bug in this engine or this replay.
-`tests/fixtures/lobster_sample/` (a small hand-built fixture covering
-every message type, see its own README) is what `make lobster-test` runs
-by default and what's wired into CI, precisely because it doesn't have
-this real-world gap — it's a regression test for the replay tool itself,
-not a substitute for real-data validation.
+
+**Update — AAPL/AMZN days added, and the story above was only half of
+it.** Two bugs in the replay tool, both fixed: Type 4 used to become a
+market order against our own best price (right only if the book is
+already perfect -- one miss and it eats the wrong orders forever; AAPL
+order 56951361 was fully executed at 10:07 and still resting at the
+close), and rows in a same-timestamp sweep were only compared on the
+last one, though LOBSTER syncs its book after every row. Type 4 is now a
+reduce-by-id like Type 2, and every row is compared.
+
+That alone didn't move the mismatch rate, because the bigger problem is
+the data. **A level-5 extract only carries events that touch the visible
+top 5 levels.** Zero of the 550k messages across the three days are
+priced outside the window, and the chance an order is never cancelled or
+filled anywhere in the file climbs straight down the book:
+
+| depth at submission | AAPL never removed | GOOG never removed |
+|---------------------|--------------------|--------------------|
+| level 1             | 4.1%               | 4.7%               |
+| level 3             | 10.3%              | 16.9%              |
+| level 5             | 37.8%              | 46.1%              |
+
+Those orders were cancelled while too deep to report. Replaying messages
+alone rests them forever -- AAPL finishes the day holding 6,268 bids
+priced above the closing ask, a book crossed by $1.72 in places. That,
+not the engine, was 99.9% of the mismatches: an independent Python
+rebuild that never touches the engine reproduces the engine's counts
+exactly (AAPL 289,380 of 289,390, and likewise for GOOG and AMZN).
+
+So `lobster_replay` now resyncs to the visible window after comparing
+each row (see its header). **Result: 0 mismatches over all three full
+days** -- 273,076 compared rows on AAPL, 101,092 on GOOG, 136,162 on
+AMZN, with 0 executions rejected and 0 baseline/opt divergences. Since
+ground truth feeds state back in, the harness is mutation-tested rather
+than trusted: injecting an off-by-one into Type 4 gives 7,329
+mismatches, dropping 1-in-1000 Type 3s gives 53, inflating Type 1 qty by
+1 gives 60,835.
+
+What this does and doesn't prove: the engine's add / reduce-by-id /
+cancel-by-id paths reproduce a real exchange's own book, one message at
+a time, over half a million real events. It says nothing about the
+matching path (`ob_market_*`), the player account or risk checks --
+nothing in a LOBSTER replay exercises those; that's still
+`tests/test_correctness.cpp`'s job.
 
 ```bash
 make lobster-test  LOBSTER_MSG=data/lobster/TICKER_message.csv \
@@ -837,7 +909,7 @@ SPSC ring buffer is correct precisely because each of `head`/`tail` is
 written by only one of the two threads, ever (`include/spsc_ring.h`).
 
 **Correctness came first, same as everywhere else in this project.**
-`tests/test_spsc_ring.c` proves FIFO ordering and the exact capacity
+`tests/test_spsc_ring.cpp` proves FIFO ordering and the exact capacity
 boundary single-threaded, then runs a genuine two-thread stress test: one
 producer thread pushes 2,000,000 sequential integers, one consumer thread
 pops and asserts every single one arrives, in order, with nothing lost or
@@ -846,10 +918,10 @@ duplicated. Critically, this was also run under **ThreadSanitizer**
 races, and a lock-free queue's entire risk surface *is* a potential data
 race on `head`/`tail`. Clean under both, which is what actually justifies
 trusting the `memory_order_acquire`/`memory_order_release` pairing in
-`spsc_ring.c` rather than just asserting it's correct because the logic
+`spsc_ring.h` rather than just asserting it's correct because the logic
 looks textbook.
 
-**Then it was measured, not assumed to help** (`bench/threaded_bench.c`,
+**Then it was measured, not assumed to help** (`bench/threaded_bench.cpp`,
 `make threaded-bench`): a receiver thread injects randomized busy-spin
 "jitter" before each message (standing in for unpredictable receive-side
 cost) and pushes it into the ring; the matching thread pops and matches in
@@ -903,8 +975,8 @@ technique backfires, with the data to back it up.
 make test         # build + run the replay, lifecycle, stress, and spsc_ring tests
 make bench        # runs `make test` first, then builds + runs the benchmark
 make asan         # rebuild the tests with clang(++) -fsanitize=address,undefined and run them
-make tsan         # rebuild test_spsc_ring with clang -fsanitize=thread and run it
-make cppcheck     # static analysis over the engine (C++17) plus bench/tests/tools (C)
+make tsan         # rebuild test_spsc_ring with clang++ -fsanitize=thread and run it
+make cppcheck     # static analysis (C++17) over src/, bench/, tests/, tools/
 make depth-sweep  # ~40s: the cancel/modify-by-id table in the Results section above, regenerated live
 make visualize    # builds build/book_visualizer.html — open it in a browser
 open tools/capability_map.html  # static reference, no build step, no code reading
@@ -914,15 +986,10 @@ make lobster-bench   # real-order-flow latency benchmark, same LOBSTER_* overrid
 make clean        # remove build/
 ```
 
-The engine is C++ now, so `test_correctness`/`benchmark`/every other
-target links a C file against a C++-compiled object — the Makefile does
-this as two compile steps (`gcc`/`cc` for the `.c` file, `g++` for
-`orderbook_engine.cpp`) plus a `g++`-driven link so `libstdc++` resolves.
-Building anything by hand outside the Makefile needs the same two steps:
+Everything is C++17 and built with `g++` (sanitizer targets use
+`clang++`). Building a target by hand outside the Makefile is one step:
 ```bash
-g++ -O2 -Wall -Wextra -std=c++17 -Iinclude -c src/orderbook_engine.cpp -o orderbook_engine.o
-gcc -O2 -Wall -Wextra -Iinclude -c tests/test_correctness.c -o test_correctness.o
-g++ -o test_correctness test_correctness.o orderbook_engine.o
+g++ -O2 -Wall -Wextra -std=c++17 -Iinclude -o test_correctness tests/test_correctness.cpp src/orderbook_engine.cpp
 ./test_correctness
 ```
 

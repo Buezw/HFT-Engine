@@ -1,5 +1,5 @@
 // ============================================================================
-// book_trace.c
+// book_trace.cpp
 //
 // Runs a fixed, reproducible scenario against the opt engine and prints
 // one JSON object per tick to stdout: full book state (every price
@@ -12,15 +12,15 @@
 // ob_place_limit_*_opt, ob_cancel_order_opt, the read-only accessors) --
 // this is a viewer, not a second implementation of anything.
 // ============================================================================
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include "orderbook_engine.h"
 
-// Same fixed-seed xorshift32 used in tests/test_correctness.c, so this
+// Same fixed-seed xorshift32 used in tests/test_correctness.cpp, so this
 // scenario reproduces identically on every run/platform.
 static uint32_t rng_state = 0xC0FFEEu;
-static uint32_t xorshift32(void) {
+static uint32_t xorshift32() {
     uint32_t x = rng_state;
     x ^= x << 13;
     x ^= x >> 17;
@@ -28,7 +28,7 @@ static uint32_t xorshift32(void) {
     return rng_state = x;
 }
 static int rand_range(int lo, int hi) { // inclusive
-    return lo + (int)(xorshift32() % (uint32_t)(hi - lo + 1));
+    return lo + static_cast<int>(xorshift32() % static_cast<uint32_t>(hi - lo + 1));
 }
 
 static void print_side(const L3OrderBook *ob, int is_bid) {
@@ -62,12 +62,12 @@ static void print_tick(int tick, const L3OrderBook *ob, const EngineAccount *acc
     // trusting it. An empty bid side (possible now that levels can
     // actually run dry) has no price to mark against; skip marking then.
     int best_bid = ob_level_price(ob, 1, 0);
-    long pnl = acc->my_cash + (best_bid > 0 ? (long)acc->my_inventory * best_bid : 0) - INITIAL_CAPITAL;
+    long pnl = acc->my_cash + (best_bid > 0 ? static_cast<long>(acc->my_inventory) * best_bid : 0) - INITIAL_CAPITAL;
     printf("],\"account\":{\"cash\":%ld,\"inventory\":%d,\"pnl\":%ld,\"fill_volume\":%ld}}\n",
            acc->my_cash, acc->my_inventory, pnl, acc->total_fill_volume);
 }
 
-#define MAX_OPEN_ORDERS 64
+constexpr int MAX_OPEN_ORDERS = 64;
 static int open_ids[MAX_OPEN_ORDERS];
 static int open_count = 0;
 
@@ -75,7 +75,7 @@ static void track_open(int id) {
     if (id < 0 || open_count >= MAX_OPEN_ORDERS) return;
     open_ids[open_count++] = id;
 }
-static int pop_random_open(void) {
+static int pop_random_open() {
     if (open_count == 0) return -1;
     int i = rand_range(0, open_count - 1);
     int id = open_ids[i];
@@ -84,7 +84,7 @@ static int pop_random_open(void) {
 }
 
 int main(int argc, char **argv) {
-    int ticks = (argc > 1) ? atoi(argv[1]) : 300;
+    int ticks = (argc > 1) ? std::atoi(argv[1]) : 300;
 
     L3OrderBook *ob = ob_create();
     EngineAccount acc;

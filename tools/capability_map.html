@@ -138,7 +138,7 @@
 
 <div class="page">
 
-  <p class="eyebrow">github.com/Buezw/HFT-Engine &middot; src/orderbook_engine.c</p>
+  <p class="eyebrow">github.com/Buezw/HFT-Engine &middot; src/orderbook_engine.cpp</p>
   <h1>这个引擎到底能干什么</h1>
   <p class="subtitle">不用看代码的功能清单——每个能力配一句大白话说明，加上对应的函数名（方便回代码里查），<b style="color:var(--base)">蓝色</b>是 baseline（main.c 原样搬过来的行为），<b style="color:var(--opt)">琥珀色</b>是 opt（优化版，外部行为一致，内部更快）。</p>
 
@@ -334,7 +334,7 @@
         </div>
         <figcaption>
           <span style="color:var(--warn); font-weight:600;">● 线性扫描</span>（<code>ob_cancel_order_opt</code> / <code>ob_modify_qty_opt</code>，两者几乎重合，取平均画一条线）随深度增长逼近线性上涨；
-          <span style="color:var(--good); font-weight:600;">● 索引查找</span>（<code>_opt_indexed</code> 变体）全程压在 ~22ns，几乎看不出随深度变化——这就是 O(1) 这三个字在图上的样子。数据来自本机重新跑的 <code>bench/benchmark.c</code>，6 个深度各测 50 万次调用。
+          <span style="color:var(--good); font-weight:600;">● 索引查找</span>（<code>_opt_indexed</code> 变体）全程压在 ~22ns，几乎看不出随深度变化——这就是 O(1) 这三个字在图上的样子。数据来自本机重新跑的 <code>bench/benchmark.cpp</code>，6 个深度各测 50 万次调用。
         </figcaption>
       </figure>
     </div>
@@ -435,7 +435,7 @@
         </figcaption>
       </figure>
       <div class="fnlist">
-        <div class="fnrow"><span class="tag opt"></span><div><div class="sig"><span class="fn">spsc_push</span> / <span class="fn">spsc_pop</span></div><div class="note">无锁的单生产者/单消费者队列，两个线程之间传消息不用加锁</div></div></div>
+        <div class="fnrow"><span class="tag opt"></span><div><div class="sig"><span class="fn">SpscRing::push</span> / <span class="fn">SpscRing::pop</span></div><div class="note">无锁的单生产者/单消费者队列，两个线程之间传消息不用加锁</div></div></div>
       </div>
       <div class="finding"><b>意外发现：</b>把两个线程强行绑定到指定 CPU 核心上，反而制造出一个稳定复现的 ~12.5ms 超长卡顿——这是台大家共用的机器，绑核心相当于关掉了操作系统"帮你避开拥堵"的能力。</div>
     </div>
@@ -447,15 +447,15 @@
     <p class="sec-desc">这个项目的核心纪律：先证明"一样"，才谈"更快"。</p>
     <div class="cap">
       <div class="fnlist">
-        <div class="fnrow"><span class="tag both"></span><div><div class="sig">tests/test_correctness.c</div><div class="note">200k-tick 回放 + 4 组各 5 万次随机压测，每一步都比对 baseline/opt 状态</div></div></div>
-        <div class="fnrow"><span class="tag both"></span><div><div class="sig">tests/test_spsc_ring.c</div><div class="note">200 万条消息的真·双线程压测，专门跑在 ThreadSanitizer 下（ASan 抓不到数据竞争）</div></div></div>
+        <div class="fnrow"><span class="tag both"></span><div><div class="sig">tests/test_correctness.cpp</div><div class="note">200k-tick 回放 + 4 组各 5 万次随机压测，每一步都比对 baseline/opt 状态</div></div></div>
+        <div class="fnrow"><span class="tag both"></span><div><div class="sig">tests/test_spsc_ring.cpp</div><div class="note">200 万条消息的真·双线程压测，专门跑在 ThreadSanitizer 下（ASan 抓不到数据竞争）</div></div></div>
         <div class="fnrow"><span class="tag both"></span><div><div class="sig">bench/*.c + make visualize</div><div class="note">延迟分布（p50/p99）、深度扫描、可拖动的网页版盘口回放</div></div></div>
       </div>
     </div>
   </section>
 
   <footer>
-    <span>src/orderbook_engine.c · include/orderbook_engine.h · include/spsc_ring.h</span>
+    <span>src/orderbook_engine.cpp · include/orderbook_engine.h · include/spsc_ring.h</span>
     <span>baseline 与 opt 的等价性由 memcmp(L3OrderBook) 逐字节验证</span>
   </footer>
 

@@ -17,42 +17,39 @@
 // price levels you track. This is a C++ rewrite of the core around a
 // dynamic, price-indexed book (std::map/std::deque) with no depth limit --
 // a level exists exactly when at least one order rests there, same as a
-// real venue. The public API below stays C-callable (extern "C") so
-// tests/bench/tools can stay plain C and just link against it.
+// real venue. Everything that links against it (tests/, bench/, tools/)
+// is C++ too now; the free-function ob_* API below is kept as-is so none
+// of those call sites had to change shape.
 // ============================================================================
 #ifndef ORDERBOOK_ENGINE_H
 #define ORDERBOOK_ENGINE_H
 
-#define INITIAL_CAPITAL 500000
+constexpr long INITIAL_CAPITAL = 500000;
 // Pre-trade position limit for the player's own risk-checked market
 // orders (see ob_market_*_risk_checked_* below). A random 100k-op stress
 // test against the raw engine once drove my_inventory to -168,805 with
 // zero pushback, which is what motivated adding this.
-#define MAX_POSITION    500
+constexpr int MAX_POSITION = 500;
 // Prices must be positive -- not a depth-window floor anymore (there's no
 // window), just basic input validation on insert.
-#define MIN_PRICE       1
+constexpr int MIN_PRICE = 1;
 
-typedef struct {
+struct EngineAccount {
     long   my_cash;
     int    my_inventory;
     long   current_total_assets;
     int    global_order_id;
     long   total_fill_volume;
     int    window_trade_qty;
-} EngineAccount;
+};
 
 // Opaque -- the real definition (src/orderbook_engine.cpp) holds a
 // std::map<price, level> per side plus (for the opt functions only) an
 // order_id index. Nothing outside the engine reaches into it directly;
 // use the accessors near the bottom of this file instead.
-typedef struct L3OrderBook L3OrderBook;
+struct L3OrderBook;
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-L3OrderBook *ob_create(void);
+L3OrderBook *ob_create();
 void         ob_destroy(L3OrderBook *ob);
 
 // ---- Baseline / optimized, side by side, same as before ----
@@ -147,7 +144,7 @@ int ob_market_sell_risk_checked_opt     (L3OrderBook *ob, EngineAccount *acc, in
 
 // ----------------------------------------------------------------------
 // Read-only accessors -- L3OrderBook is opaque now, so this is how
-// outside code (tests, benchmarks, tools/book_trace.c, the LOBSTER
+// outside code (tests, benchmarks, tools/book_trace.cpp, the LOBSTER
 // tools) reads book state instead of reaching into struct fields
 // directly. level_index counts from the best price (0 = best). All
 // return -1 (or 0 for ob_level_order_at) if is_bid/level_index/slot is
@@ -183,9 +180,5 @@ int ob_dump_levels(const L3OrderBook *ob, int is_bid, int max_levels, int *out_p
 // ever represent prices that actually have resting orders, so there's no
 // representational gap to bridge anymore.
 long ob_qty_at_price(const L3OrderBook *ob, int is_bid, int price);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif // ORDERBOOK_ENGINE_H

@@ -1,5 +1,5 @@
 // ============================================================================
-// test_correctness.c
+// test_correctness.cpp
 //
 // Same idea as before the C++ rewrite: replay the same sequence of
 // market-maker additions, market buy/sell events, and lifecycle
@@ -14,9 +14,8 @@
 // same price levels, in the same order, same qty, same orders resting
 // at each one -- checked through the public accessors, not raw memory.
 // ============================================================================
-#include <stdio.h>
-#include <string.h>
-#include <stdint.h>
+#include <cstdint>
+#include <cstdio>
 #include "orderbook_engine.h"
 
 // ob_books_equal (native, single linear pass inside the engine) -- do
@@ -54,9 +53,9 @@ static int order_live_at(const L3OrderBook *ob, int is_bid, int price, int id, i
 }
 
 // Fixed-seed xorshift32 -- deterministic across platforms/runs, same PRNG
-// tools/book_trace.c uses for its own reproducible scenario.
+// tools/book_trace.cpp uses for its own reproducible scenario.
 static uint32_t rng_state = 0xC0FFEEu;
-static uint32_t xorshift32(void) {
+static uint32_t xorshift32() {
     uint32_t x = rng_state;
     x ^= x << 13;
     x ^= x >> 17;
@@ -64,15 +63,15 @@ static uint32_t xorshift32(void) {
     return rng_state = x;
 }
 static int rand_range(int lo, int hi) { // inclusive
-    return lo + (int)(xorshift32() % (uint32_t)(hi - lo + 1));
+    return lo + static_cast<int>(xorshift32() % static_cast<uint32_t>(hi - lo + 1));
 }
 
 // ============================================================================
 // Test 1: N-tick behavioral replay, baseline vs opt.
 // ============================================================================
-#define SEED_SPREAD 3 // how many price levels each side gets seeded with -- a starting shape, not a limit
+constexpr int SEED_SPREAD = 3; // how many price levels each side gets seeded with -- a starting shape, not a limit
 
-static int test_tick_replay(void) {
+static int test_tick_replay() {
     L3OrderBook *ob_base = ob_create(), *ob_opt = ob_create();
     EngineAccount acc_base, acc_opt;
 
@@ -170,8 +169,9 @@ static int test_tick_replay(void) {
 // neither limit exists anymore: many orders at one level, and orders at
 // prices far outside any "reasonable" window, both just work.
 // ============================================================================
-static int test_no_capacity_bounds_one(const char *label,
-                                        int (*add)(L3OrderBook *, int, int, int, int, int)) {
+using add_fn = int (*)(L3OrderBook *, int, int, int, int, int);
+
+static int test_no_capacity_bounds_one(const char *label, add_fn add) {
     L3OrderBook *ob = ob_create();
     int fails = 0;
 
@@ -212,7 +212,7 @@ static int test_no_capacity_bounds_one(const char *label,
     return fails;
 }
 
-static int test_no_capacity_bounds(void) {
+static int test_no_capacity_bounds() {
     int failures = 0;
     failures += test_no_capacity_bounds_one("ob_add_order_baseline", ob_add_order_baseline);
     failures += test_no_capacity_bounds_one("ob_add_order_opt",      ob_add_order_opt);
@@ -222,7 +222,7 @@ static int test_no_capacity_bounds(void) {
 // ============================================================================
 // Test 3: resting limit-order lifecycle (place / cancel), deterministic.
 // ============================================================================
-static int test_limit_order_lifecycle(void) {
+static int test_limit_order_lifecycle() {
     L3OrderBook *ob_base = ob_create(), *ob_opt = ob_create();
     EngineAccount acc_base, acc_opt;
     ob_init_baseline(ob_base, &acc_base, 100);
@@ -238,7 +238,7 @@ static int test_limit_order_lifecycle(void) {
                buy_id_base, buy_id_opt);
         fails++;
     }
-    long expect_reserved = (long)20 * 99;
+    long expect_reserved = 20L * 99;
     if (acc_base.my_cash != cash_before_base - expect_reserved ||
         acc_opt.my_cash  != cash_before_opt  - expect_reserved) {
         printf("FAIL: limit buy did not reserve cash correctly (base=%ld opt=%ld, expected -%ld)\n",
@@ -300,7 +300,7 @@ static int test_limit_order_lifecycle(void) {
 // ============================================================================
 // Test 4: randomized stress mixing market orders, placements, and cancels.
 // ============================================================================
-static int test_random_stress(void) {
+static int test_random_stress() {
     L3OrderBook *ob_base = ob_create(), *ob_opt = ob_create();
     EngineAccount acc_base, acc_opt;
     ob_init_baseline(ob_base, &acc_base, 100);
@@ -364,7 +364,7 @@ static int test_random_stress(void) {
 // ============================================================================
 // Test 5: pre-trade risk limit.
 // ============================================================================
-static int test_risk_limit_clipping(void) {
+static int test_risk_limit_clipping() {
     L3OrderBook *ob = ob_create();
     EngineAccount acc;
     ob_init_opt(ob, &acc, 100);
@@ -394,7 +394,7 @@ static int test_risk_limit_clipping(void) {
     return fails;
 }
 
-static int test_risk_limit_end_to_end(void) {
+static int test_risk_limit_end_to_end() {
     L3OrderBook *ob_base = ob_create(), *ob_opt = ob_create();
     EngineAccount acc_base, acc_opt;
     ob_init_baseline(ob_base, &acc_base, 100);
@@ -445,7 +445,7 @@ static int test_risk_limit_end_to_end(void) {
 // Test 6: cancel-replace (order modification) -- deterministic lifecycle,
 // then folded into a randomized stress run alongside market/limit/cancel.
 // ============================================================================
-static int test_modify_order_lifecycle(void) {
+static int test_modify_order_lifecycle() {
     L3OrderBook *ob_base = ob_create(), *ob_opt = ob_create();
     EngineAccount acc_base, acc_opt;
     ob_init_baseline(ob_base, &acc_base, 100);
@@ -464,7 +464,7 @@ static int test_modify_order_lifecycle(void) {
     long cash_before_inc_base = acc_base.my_cash, cash_before_inc_opt = acc_opt.my_cash;
     int r_base = ob_modify_qty_baseline(ob_base, &acc_base, id_base, 35);
     int r_opt  = ob_modify_qty_opt(ob_opt, &acc_opt, id_opt, 35);
-    long expect_extra = (long)(35 - 20) * 99;
+    long expect_extra = (35L - 20) * 99;
     if (!r_base || !r_opt) {
         printf("FAIL: modify_qty increase was rejected (base=%d opt=%d)\n", r_base, r_opt);
         fails++;
@@ -483,7 +483,7 @@ static int test_modify_order_lifecycle(void) {
     long cash_before_dec_base = acc_base.my_cash, cash_before_dec_opt = acc_opt.my_cash;
     r_base = ob_modify_qty_baseline(ob_base, &acc_base, id_base, 5);
     r_opt  = ob_modify_qty_opt(ob_opt, &acc_opt, id_opt, 5);
-    long expect_refund = (long)(35 - 5) * 99;
+    long expect_refund = (35L - 5) * 99;
     if (!r_base || !r_opt ||
         acc_base.my_cash != cash_before_dec_base + expect_refund ||
         acc_opt.my_cash  != cash_before_dec_opt  + expect_refund) {
@@ -528,7 +528,7 @@ static int test_modify_order_lifecycle(void) {
         printf("FAIL: modify_price did not place the new order at the new price\n");
         fails++;
     }
-    long expect_move_cash_delta = (long)5 * 99 - (long)12 * 97;
+    long expect_move_cash_delta = 5L * 99 - 12L * 97;
     if (acc_base.my_cash != cash_before_move_base + expect_move_cash_delta ||
         acc_opt.my_cash  != cash_before_move_opt  + expect_move_cash_delta) {
         printf("FAIL: modify_price's net cash effect (refund old, reserve new) was wrong\n");
@@ -560,7 +560,7 @@ static int test_modify_order_lifecycle(void) {
     return fails;
 }
 
-static int test_modify_random_stress(void) {
+static int test_modify_random_stress() {
     L3OrderBook *ob_base = ob_create(), *ob_opt = ob_create();
     EngineAccount acc_base, acc_opt;
     ob_init_baseline(ob_base, &acc_base, 100);
@@ -640,7 +640,7 @@ static int test_modify_random_stress(void) {
 // Confirms the existing is_mine-gated functions correctly ignore such an
 // order, and the any-* functions correctly find and mutate it.
 // ============================================================================
-static int test_any_order_cancel_reduce_lifecycle(void) {
+static int test_any_order_cancel_reduce_lifecycle() {
     L3OrderBook *ob_base = ob_create(), *ob_opt = ob_create();
     EngineAccount acc_base, acc_opt;
     ob_init_baseline(ob_base, &acc_base, 100);
@@ -741,7 +741,7 @@ static int test_any_order_cancel_reduce_lifecycle(void) {
 // fill was settling BOTH legs, on top of the reservation place_limit_*
 // already made, silently double-charging every single fill.
 // ============================================================================
-static int test_resting_fill_settlement(void) {
+static int test_resting_fill_settlement() {
     L3OrderBook *ob_base = ob_create(), *ob_opt = ob_create();
     EngineAccount acc_base, acc_opt;
     ob_init_baseline(ob_base, &acc_base, 100);
@@ -810,9 +810,9 @@ static int test_resting_fill_settlement(void) {
                acc_base.my_inventory, acc_opt.my_inventory, inv_before - inv_reserved);
         fails++;
     }
-    if (acc_base.my_cash != cash_before + (long)10 * 100 || acc_opt.my_cash != cash_before + (long)10 * 100) {
+    if (acc_base.my_cash != cash_before + 10L * 100 || acc_opt.my_cash != cash_before + 10L * 100) {
         printf("FAIL: resting sell fill didn't credit sale proceeds (base=%ld opt=%ld, expected %ld)\n",
-               acc_base.my_cash, acc_opt.my_cash, cash_before + (long)10 * 100);
+               acc_base.my_cash, acc_opt.my_cash, cash_before + 10L * 100);
         fails++;
     }
 
@@ -830,7 +830,7 @@ static int test_resting_fill_settlement(void) {
     return fails;
 }
 
-int main(void) {
+int main() {
     int failures = 0;
     failures += test_tick_replay();
     failures += test_no_capacity_bounds();

@@ -3,10 +3,10 @@
 # render_trace.py
 #
 # Wraps build/book_trace.jsonl (one JSON object per tick, from
-# tools/book_trace.c) into tools/visualizer_template.html, producing a
+# tools/book_trace.cpp) into tools/visualizer_template.html, producing a
 # single self-contained HTML file with the trace data embedded directly —
 # no server, no fetch, just `open` it in a browser. Kept as a separate
-# template/script pair rather than having book_trace.c print HTML directly,
+# template/script pair rather than having book_trace.cpp print HTML directly,
 # so the page's CSS/JS can be edited as plain HTML instead of escaped C
 # string literals.
 # ============================================================================

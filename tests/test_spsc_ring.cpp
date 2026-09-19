@@ -1,9 +1,9 @@
 // ============================================================================
-// test_spsc_ring.c
+// test_spsc_ring.cpp
 //
 // Same "correctness before trusting a benchmark" discipline as
-// test_correctness.c: this proves spsc_ring.h's push/pop before
-// bench/threaded_bench.c's numbers mean anything, and includes a genuine
+// test_correctness.cpp: this proves spsc_ring.h's push/pop before
+// bench/threaded_bench.cpp's numbers mean anything, and includes a genuine
 // multi-threaded stress test, not just single-threaded boundary checks.
 //
 // Build this specifically under ThreadSanitizer (`make tsan`), not just
@@ -13,9 +13,8 @@
 // tool that actually caught the real out-of-bounds write in
 // ob_add_order_opt (see README) instead of just reasoning it was fine.
 // ============================================================================
-#include <stdio.h>
-#include <stdint.h>
-#include <pthread.h>
+#include <cstdio>
+#include <thread>
 #include "spsc_ring.h"
 
 static int failures = 0;
@@ -23,13 +22,12 @@ static int failures = 0;
 // ============================================================================
 // Test 1: basic FIFO ordering, single-threaded.
 // ============================================================================
-static void test_fifo_order(void) {
+static void test_fifo_order() {
     SpscRing r;
-    spsc_init(&r);
 
     for (int i = 0; i < 10; i++) {
         EngineMsg m = { MSG_MARKET_BUY, i };
-        if (!spsc_push(&r, m)) {
+        if (!r.push(m)) {
             printf("FAIL: push %d unexpectedly failed on an empty-ish ring\n", i);
             failures++;
         }
@@ -37,7 +35,7 @@ static void test_fifo_order(void) {
 
     for (int i = 0; i < 10; i++) {
         EngineMsg m;
-        if (!spsc_pop(&r, &m)) {
+        if (!r.pop(m)) {
             printf("FAIL: pop %d unexpectedly failed\n", i);
             failures++;
             continue;
@@ -49,7 +47,7 @@ static void test_fifo_order(void) {
     }
 
     EngineMsg m;
-    if (spsc_pop(&r, &m)) {
+    if (r.pop(m)) {
         printf("FAIL: pop succeeded on a ring that should be empty (got qty=%d)\n", m.qty);
         failures++;
     }
@@ -64,26 +62,25 @@ static void test_fifo_order(void) {
 // "full") — push must start failing exactly there, and popping one must
 // free exactly one slot back up.
 // ============================================================================
-static void test_capacity_boundary(void) {
+static void test_capacity_boundary() {
     SpscRing r;
-    spsc_init(&r);
 
     int pushed = 0;
-    while (spsc_push(&r, (EngineMsg){ MSG_MARKET_SELL, pushed })) pushed++;
+    while (r.push(EngineMsg{ MSG_MARKET_SELL, pushed })) pushed++;
 
-    if (pushed != SPSC_CAPACITY - 1) {
+    if (pushed != static_cast<int>(SPSC_CAPACITY) - 1) {
         printf("FAIL: expected exactly %d successful pushes before the ring reported full, got %d\n",
-               SPSC_CAPACITY - 1, pushed);
+               static_cast<int>(SPSC_CAPACITY) - 1, pushed);
         failures++;
     }
 
     EngineMsg m;
-    if (!spsc_pop(&r, &m) || m.qty != 0) {
+    if (!r.pop(m) || m.qty != 0) {
         printf("FAIL: pop after filling to capacity did not return the oldest message\n");
         failures++;
     }
 
-    if (!spsc_push(&r, (EngineMsg){ MSG_MARKET_SELL, 999 })) {
+    if (!r.push(EngineMsg{ MSG_MARKET_SELL, 999 })) {
         printf("FAIL: push failed to reclaim the slot freed by the pop above\n");
         failures++;
     }
@@ -100,32 +97,25 @@ static void test_capacity_boundary(void) {
 // no single-threaded test can exercise, since it requires two threads
 // genuinely racing on the same head/tail fields.
 // ============================================================================
-#define N_ITEMS 2000000
+constexpr int N_ITEMS = 2000000;
 
-static SpscRing g_ring;
+static void test_multithreaded_stress() {
+    SpscRing ring;
 
-static void *stress_producer(void *arg) {
-    (void)arg;
-    for (int i = 0; i < N_ITEMS; i++) {
-        EngineMsg m = { MSG_MARKET_BUY, i };
-        while (!spsc_push(&g_ring, m)) { /* ring full: spin-retry */ }
-    }
-    EngineMsg stop = { MSG_STOP, 0 };
-    while (!spsc_push(&g_ring, stop)) { }
-    return NULL;
-}
-
-static void test_multithreaded_stress(void) {
-    spsc_init(&g_ring);
-
-    pthread_t producer;
-    pthread_create(&producer, NULL, stress_producer, NULL);
+    std::thread producer([&ring] {
+        for (int i = 0; i < N_ITEMS; i++) {
+            EngineMsg m = { MSG_MARKET_BUY, i };
+            while (!ring.push(m)) { /* ring full: spin-retry */ }
+        }
+        EngineMsg stop = { MSG_STOP, 0 };
+        while (!ring.push(stop)) { }
+    });
 
     int expected = 0;
     int local_failures = 0;
     for (;;) {
         EngineMsg m;
-        while (!spsc_pop(&g_ring, &m)) { /* spin-wait */ }
+        while (!ring.pop(m)) { /* spin-wait */ }
         if (m.type == MSG_STOP) break;
         if (m.qty != expected) {
             if (local_failures < 5) {
@@ -137,7 +127,7 @@ static void test_multithreaded_stress(void) {
         expected++;
     }
 
-    pthread_join(producer, NULL);
+    producer.join();
 
     if (expected != N_ITEMS) {
         printf("FAIL: consumer only saw %d of %d items before MSG_STOP\n", expected, N_ITEMS);
@@ -151,7 +141,7 @@ static void test_multithreaded_stress(void) {
     printf("PASS: %d items crossed the ring between two real threads, in exact order, none lost or duplicated\n", N_ITEMS);
 }
 
-int main(void) {
+int main() {
     test_fifo_order();
     test_capacity_boundary();
     test_multithreaded_stress();

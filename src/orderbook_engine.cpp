@@ -344,9 +344,7 @@ const PriceLevel *level_at(const L3OrderBook *ob, int is_bid, int level_index) {
 
 } // namespace
 
-extern "C" {
-
-L3OrderBook *ob_create(void) { return new L3OrderBook(); }
+L3OrderBook *ob_create() { return new L3OrderBook(); }
 void ob_destroy(L3OrderBook *ob) { delete ob; }
 
 void ob_init_baseline(L3OrderBook *ob, EngineAccount *acc, int base_price) { init_impl(ob, acc, base_price, false); }
@@ -483,5 +481,3 @@ int ob_dump_levels(const L3OrderBook *ob, int is_bid, int max_levels, int *out_p
     }
     return n;
 }
-
-} // extern "C"
